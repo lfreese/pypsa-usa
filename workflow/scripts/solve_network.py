@@ -182,6 +182,75 @@ def prepare_network(
     return n
 
 
+def add_constant_cost_constraints(n, sns, config, existing_data):
+    """
+    Add a constant cost constraint to the network.
+
+    This function adds a constraint to the network to ensure that the total
+    cost of the network in a given region is equal to a constant value.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        The PyPSA network object.
+    config : dict
+        A dictionary containing configuration settings and file paths.
+
+    Returns
+    -------
+    None
+    """
+    logger.info("Adding constant cost constraint.")
+
+    foresight = config["foresight"]
+    logger.info(f"Using {foresight} foresight")
+
+    # match foresight:
+    #     case "perfect":
+    #         logger.info("Using existing data inputs for constant cost constraint")
+    #         region_cost_lim = pd.read_csv(config['electricity']['cost_constraints'])
+    #     case "myopic":
+    #     ## Sum costs from previous simulation or from the first time step (TBD)
+    #         ## give option to input a file or to have it from previous simulation
+
+    #             logger.info("No existing data to use for constant cost constraint, using first time step from myopic run")
+    #             region_cost_lim = ## CREATE FROM OLD NETWORK
+    #         if existing_data == True:
+    #             logger.info("Using existing data inputs for constant cost constraint")
+    #             region_cost_lim = pd.read_csv(config['electricity']['cost_constraints'])
+
+    #         elif existing_data == False:
+
+    #             logger.info("No existing data to use for constant cost constraint, using first time step from myopic run")
+
+    #             ## RHS for generators
+    #             gen_costs = n.generators[n.generators.columns[n.generators.columns.str.contains('cost')]] #select cost columns
+    #             gen_costs = gen_costs.loc[n.get_active_assets('Generators', sns)] #select the active assets
+    #             gen_costs = gen_costs.sum(axis = 1) #sum the costs
+
+    #             ## RHS for links
+    #             link_costs = n.links[n.links.columns[n.links.columns.str.contains('cost')]].sum(axis = 1)
+
+    #             ## Sum the costs for each bus
+
+    #             region_cost_lim = ## CREATE FROM OLD NETWORK
+
+    #     ## assign this value to the rhs of the constraint
+    #     rhs = region_cost_lim
+    #     ## create the lhs of the constraint
+    #     lhs =
+    #     ## add the constraint to the network
+
+    #     n.model.add_constraints(
+    #         lhs <= rhs,
+    #         name = f"GlobalConstraint-{constant_cost.name}_{planning_horizon}_constant_cost"
+    #     )
+
+    #     logger.info(
+    #         f"Adding regional cost Limit for {emission_lim.name} in {planning_horizon}"
+    #     )
+
+
 def add_technology_capacity_target_constraints(n, config):
     """
     Add Technology Capacaity Target (TCT) constraint to the network.
@@ -618,7 +687,7 @@ def add_regional_co2limit(n, sns, config):
     )
 
     logger.info("Adding regional Co2 Limits.")
-
+    # breakpoint()
     # Filter the regional_co2_lims DataFrame based on the planning horizons present in the snapshots
     regional_co2_lims = regional_co2_lims[regional_co2_lims.planning_horizon.isin(sns.get_level_values(0))]
     weightings = n.snapshot_weightings.loc[n.snapshots]
@@ -748,7 +817,7 @@ def add_SAFER_constraints(n, config):
         config["electricity"]["SAFE_regional_reservemargins"],
         index_col=[0],
     )
-
+    # breakpoint()
     reeds_prm = pd.read_csv(
         snakemake.input.safer_reeds,
         index_col=[0],
@@ -1431,6 +1500,10 @@ def extra_functionality(n, snapshots):
         add_SAFER_constraints(n, config)
     if "TCT" in opts and n.generators.p_nom_extendable.any():
         add_technology_capacity_target_constraints(n, config)
+    if "constant_cost_existing" in opts and n.generators.p_nom_extendable.any():
+        add_constant_cost_constraints(n, config, existing_data=True)
+    if "constant_cost_generated" in opts and n.generators.p_nom_extendable.any():
+        add_constant_cost_constraints(n, config, existing_data=False)
     reserve = config["electricity"].get("operational_reserve", {})
     if reserve.get("activate"):
         add_operational_reserve_margin(n, snapshots, config)
