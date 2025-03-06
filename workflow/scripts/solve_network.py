@@ -25,6 +25,7 @@ Additionally, some extra constraints specified in :mod:`solve_network` are added
 
 import copy
 import logging
+import os
 import re
 from typing import Optional
 
@@ -41,7 +42,9 @@ from _helpers import (
 )
 from constants import NG_MWH_2_MMCF
 from eia import Trade
+from pypsa.descriptors import get_committable_i
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
+from pypsa.descriptors import nominal_attrs
 
 logger = logging.getLogger(__name__)
 pypsa.pf.logger.setLevel(logging.WARNING)
@@ -204,51 +207,155 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
 
     foresight = config["foresight"]
     logger.info(f"Using {foresight} foresight")
+    region = "national"  ## TODO --add regional breakdown
+    if foresight == "perfect":
 
-    # match foresight:
-    #     case "perfect":
-    #         logger.info("Using existing data inputs for constant cost constraint")
-    #         region_cost_lim = pd.read_csv(config['electricity']['cost_constraints'])
-    #     case "myopic":
-    #     ## Sum costs from previous simulation or from the first time step (TBD)
-    #         ## give option to input a file or to have it from previous simulation
+        logger.info("Using existing data inputs for constant cost constraint")
+        region_cost_lim = pd.read_csv(config["electricity"]["cost_constraints"])
+    elif foresight == "myopic":
+        ## Sum costs from previous simulation or from the first time step (TBD)
+        ## give option to input a file or to have it from previous simulation
+        logger.info("Myopic")
 
-    #             logger.info("No existing data to use for constant cost constraint, using first time step from myopic run")
-    #             region_cost_lim = ## CREATE FROM OLD NETWORK
-    #         if existing_data == True:
-    #             logger.info("Using existing data inputs for constant cost constraint")
-    #             region_cost_lim = pd.read_csv(config['electricity']['cost_constraints'])
+        if existing_data == True:
+            logger.info("Using existing data inputs for constant cost constraint")
+            region_cost_lim = pd.read_csv(config["electricity"]["cost_constraints"])
 
-    #         elif existing_data == False:
+        elif existing_data == False:
 
-    #             logger.info("No existing data to use for constant cost constraint, using first time step from myopic run")
+            if sns.unique("period") == n.investment_periods[0]:
+                # logger.info(f"First time horizon {sns}, do not apply constraint")
+                return
 
-    #             ## RHS for generators
-    #             gen_costs = n.generators[n.generators.columns[n.generators.columns.str.contains('cost')]] #select cost columns
-    #             gen_costs = gen_costs.loc[n.get_active_assets('Generators', sns)] #select the active assets
-    #             gen_costs = gen_costs.sum(axis = 1) #sum the costs
+            logger.info(
+                "No existing data to use for constant cost constraint, using first time step from myopic run for {sns}",
+            )
 
-    #             ## RHS for links
-    #             link_costs = n.links[n.links.columns[n.links.columns.str.contains('cost')]].sum(axis = 1)
+            ## RHS
+            region_cost_lim = n.objective
 
-    #             ## Sum the costs for each bus
+            ## LHS
+            ## TODO --add regional breakdown
 
-    #             region_cost_lim = ## CREATE FROM OLD NETWORK
+            m = n.model
+            constraint = []
 
-    #     ## assign this value to the rhs of the constraint
-    #     rhs = region_cost_lim
-    #     ## create the lhs of the constraint
-    #     lhs =
-    #     ## add the constraint to the network
+            periods = sns.unique("period")
+            period_weighting = n.investment_period_weightings.objective[periods]
 
-    #     n.model.add_constraints(
-    #         lhs <= rhs,
-    #         name = f"GlobalConstraint-{constant_cost.name}_{planning_horizon}_constant_cost"
-    #     )
+            # constant for already done investment
+            nom_attr = nominal_attrs.items()
+            constant = 0
+            for c, attr in nom_attr:
+                ext_i = n.get_extendable_i(c)
+                cost = n.static(c)["capital_cost"][ext_i]
+                if cost.empty:
+                    continue
 
-    #     logger.info(
-    #         f"Adding regional cost Limit for {emission_lim.name} in {planning_horizon}"
-    #     )
+                active = pd.concat(
+                    {period: n.get_active_assets(c, period)[ext_i] for period in sns.unique("period")},
+                    axis=1,
+                )
+                cost = active @ period_weighting * cost
+
+                constant += (cost * n.static(c)[attr][ext_i]).sum()
+            # breakpoint()
+            if constant != 0:
+                object_const = m.add_variables(
+                    constant,
+                    constant,
+                    name="constraint_constant",
+                )  ## TODO --this may not be needed
+                constraint.append(-1 * object_const)
+
+            # Weightings
+            weighting = n.snapshot_weightings.objective
+            weighting = weighting.mul(period_weighting, level=0).loc[sns]
+
+            lookup = pd.read_csv(
+                os.path.join(
+                    os.path.expanduser("~"),
+                    "Documents",
+                    "PyPSA",
+                    "pypsa",
+                    "variables.csv",
+                ),  ## TODO, hacky, is specific to my own setup
+                index_col=["component", "variable"],
+            )
+
+            # marginal costs, marginal storage cost, and spill cost
+            for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
+                for c, attr in lookup.query(cost_type).index:
+                    cost = get_as_dense(n, c, cost_type, sns).loc[:, lambda ds: (ds != 0).any()].mul(weighting, axis=0)
+                    if cost.empty:
+                        continue
+                    operation = m[f"{c}-{attr}"].sel({"snapshot": sns, c: cost.columns})
+                    constraint.append((operation * cost).sum())
+
+            # stand-by cost
+            comps = {"Generator", "Link"}
+            for c in comps:
+                com_i = get_committable_i(n, c)
+
+                if com_i.empty:
+                    continue
+
+                stand_by_cost = (
+                    get_as_dense(n, c, "stand_by_cost", sns, com_i)
+                    .loc[:, lambda ds: (ds != 0).any()]
+                    .mul(weighting, axis=0)
+                )
+                stand_by_cost.columns.name = f"{c}-com"
+                status = n.model.variables[f"{c}-status"].loc[:, stand_by_cost.columns]
+                constraint.append((status * stand_by_cost).sum())
+
+            # investment
+            for c, attr in nominal_attrs.items():
+                ext_i = n.get_extendable_i(c)
+                cost = n.static(c)["capital_cost"][ext_i]
+                if cost.empty:
+                    continue
+
+                active = pd.concat(
+                    {period: n.get_active_assets(c, period)[ext_i] for period in sns.unique("period")},
+                    axis=1,
+                )
+                cost = active @ period_weighting * cost
+
+                caps = m[f"{c}-{attr}"]
+                constraint.append((caps * cost).sum())
+
+            # unit commitment
+            keys = ["start_up", "shut_down"]  # noqa: F841
+            for c, attr in lookup.query("variable in @keys").index:
+                com_i = n.get_committable_i(c)
+                cost = n.static(c)[attr + "_cost"].reindex(com_i)
+
+                if cost.sum():
+                    var = m[f"{c}-{attr}"]
+                    constraint.append((var * cost).sum())
+
+            lhs = constraint
+
+            #######FROM OBJ FUNCTION ########
+
+            ## assign this value to the rhs of the constraint
+            rhs = int(-region_cost_lim)
+            ## create the lhs of the constraint
+            lhs = lhs  ##nat or interc or iso level
+            ## add the constraint to the network
+        # breakpoint()
+        import linopy
+
+        lhs_full = linopy.expressions.merge([lhs[x] for x in range(0, len(lhs))])
+        n.model.add_constraints(
+            lhs_full == rhs,
+            name=f"GlobalConstraint-{region}_{periods}_constant_cost",
+        )
+
+        logger.info(
+            f"Adding regional cost Limit for {region} in {periods}",
+        )
 
 
 def add_technology_capacity_target_constraints(n, config):
@@ -712,6 +819,7 @@ def add_regional_co2limit(n, sns, config):
             "efficiency",
             inds=region_gens_em.index,
         )  # mw_elect/mw_th
+
         em_pu = region_gens_em.carrier.map(emissions) / efficiency  # tonnes_co2/mw_electrical
         em_pu = em_pu.multiply(weightings.generators, axis=0).loc[planning_horizon].fillna(0)
 
@@ -719,6 +827,9 @@ def add_regional_co2limit(n, sns, config):
         p_em = n.model["Generator-p"].loc[:, region_gens_em.index].sel(period=planning_horizon)
         lhs = (p_em * em_pu).sum()
         rhs = region_co2lim
+        # gen = sum(sum(marg_cost*gen), sum(capital_cost*capacity))
+        # link = ""
+        # lhs = sum(gen, link, storage)
 
         # EF_imports = emmission_lim.get('import_emissions_factor')  # MT CO₂e/MWh_elec
         # if EF_imports > 0.0:
@@ -756,9 +867,9 @@ def add_regional_co2limit(n, sns, config):
         #         n.loads_t.p_set.loc[planning_horizon,region_loads.index].sum().sum()
         #     )
         #     rhs -= (region_demand * EF_imports)
-
+        # breakpoint()
         n.model.add_constraints(
-            lhs <= rhs,
+            lhs == rhs,
             name=f"GlobalConstraint-{emmission_lim.name}_{planning_horizon}co2_limit",
         )
 
@@ -798,6 +909,7 @@ def add_SAFE_constraints(n, config):
     exist_conv_caps = n.generators.query(
         "~p_nom_extendable & carrier in @conventional_carriers",
     ).p_nom.sum()
+
     rhs = reserve_margin - exist_conv_caps
     n.model.add_constraints(lhs >= rhs, name="safe_mintotalcap")
 
@@ -1500,10 +1612,6 @@ def extra_functionality(n, snapshots):
         add_SAFER_constraints(n, config)
     if "TCT" in opts and n.generators.p_nom_extendable.any():
         add_technology_capacity_target_constraints(n, config)
-    if "constant_cost_existing" in opts and n.generators.p_nom_extendable.any():
-        add_constant_cost_constraints(n, config, existing_data=True)
-    if "constant_cost_generated" in opts and n.generators.p_nom_extendable.any():
-        add_constant_cost_constraints(n, config, existing_data=False)
     reserve = config["electricity"].get("operational_reserve", {})
     if reserve.get("activate"):
         add_operational_reserve_margin(n, snapshots, config)
@@ -1528,6 +1636,14 @@ def extra_functionality(n, snapshots):
             add_EQ_constraints(n, o)
     add_battery_constraints(n)
     add_land_use_constraints(n)
+    if (
+        "CC" in opts and n.generators.p_nom_extendable.any()
+    ):  # and snapshots.unique('period') != n.investment_periods[0]:
+        add_constant_cost_constraints(n, snapshots, config, existing_data=True)
+    if (
+        "CCG" in opts and n.generators.p_nom_extendable.any()
+    ):  # and snapshots.unique('period') != n.investment_periods[0]:
+        add_constant_cost_constraints(n, snapshots, config, existing_data=False)
 
 
 def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
@@ -1608,7 +1724,7 @@ def solve_network(n, config, solving, opts="", **kwargs):
                 dc_i = n.links[n.links.carrier == "DC"].index
                 n.links.loc[dc_i, "p_nom_min"] = n.links.loc[dc_i, "p_nom_opt"]  # for links
 
-                for c in n.iterate_components(["Generator", "Link", "StorageUnit"]):
+                for c in n.iterate_components(["Link", "Generator", "StorageUnit"]):
                     nm = c.name
                     # limit our components that we remove/modify to those prior to this time horizon
                     c_lim = c.df.loc[n.get_active_assets(nm, planning_horizon)]
@@ -1625,32 +1741,33 @@ def solve_network(n, config, solving, opts="", **kwargs):
                     for c_idx in c_lim.index:
                         n.remove(nm, c_idx)
                     for df_idx in df.index:
-                        print(df.loc[df_idx]["land_region"])
-                        n.madd(
-                            nm,
-                            [df_idx],
-                            carrier=df.loc[df_idx].carrier,
-                            bus=df.loc[df_idx].bus,
-                            p_nom_min=df.loc[df_idx].p_nom_min,
-                            p_nom=df.loc[df_idx].p_nom,
-                            p_nom_max=df.loc[df_idx].p_nom_max,
-                            p_nom_extendable=df.loc[df_idx].p_nom_extendable,
-                            ramp_limit_up=df.loc[df_idx].ramp_limit_up,
-                            ramp_limit_down=df.loc[df_idx].ramp_limit_down,
-                            efficiency=df.loc[df_idx].efficiency,
-                            marginal_cost=df.loc[df_idx].marginal_cost,
-                            capital_cost=df.loc[df_idx].capital_cost,
-                            build_year=df.loc[df_idx].build_year,
-                            lifetime=df.loc[df_idx].lifetime,
-                            heat_rate=df.loc[df_idx].heat_rate,
-                            fuel_cost=df.loc[df_idx].fuel_cost,
-                            vom_cost=df.loc[df_idx].vom_cost,
-                            carrier_base=df.loc[df_idx].carrier_base,
-                            p_min_pu=df.loc[df_idx].p_min_pu,
-                            p_max_pu=df.loc[df_idx].p_max_pu,
-                            land_region=df.loc[df_idx].land_region,
-                        )
-                        print(n.generators.loc[df_idx]["land_region"])
+                        if nm == "Generator":
+                            n.madd(
+                                nm,
+                                [df_idx],
+                                carrier=df.loc[df_idx].carrier,
+                                bus=df.loc[df_idx].bus,
+                                p_nom_min=df.loc[df_idx].p_nom_min,
+                                p_nom=df.loc[df_idx].p_nom,
+                                p_nom_max=df.loc[df_idx].p_nom_max,
+                                p_nom_extendable=df.loc[df_idx].p_nom_extendable,
+                                ramp_limit_up=df.loc[df_idx].ramp_limit_up,
+                                ramp_limit_down=df.loc[df_idx].ramp_limit_down,
+                                efficiency=df.loc[df_idx].efficiency,
+                                marginal_cost=df.loc[df_idx].marginal_cost,
+                                capital_cost=df.loc[df_idx].capital_cost,
+                                build_year=df.loc[df_idx].build_year,
+                                lifetime=df.loc[df_idx].lifetime,
+                                heat_rate=df.loc[df_idx].heat_rate,
+                                fuel_cost=df.loc[df_idx].fuel_cost,
+                                vom_cost=df.loc[df_idx].vom_cost,
+                                carrier_base=df.loc[df_idx].carrier_base,
+                                p_min_pu=df.loc[df_idx].p_min_pu,
+                                p_max_pu=df.loc[df_idx].p_max_pu,
+                                land_region=df.loc[df_idx].land_region,
+                            )
+                        else:
+                            n.add(nm, df_idx, **df.loc[df_idx])
                     logger.info(n.consistency_check())
 
                     # copy time-dependent
