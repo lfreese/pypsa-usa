@@ -29,6 +29,7 @@ import os
 import re
 from typing import Optional
 
+import linopy
 import numpy as np
 import pandas as pd
 import pypsa
@@ -238,7 +239,6 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
             ## TODO --add regional breakdown
 
             m = n.model
-            constraint = []
 
             periods = sns.unique("period")
             period_weighting = n.investment_period_weightings.objective[periods]
@@ -259,13 +259,13 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
                 cost = active @ period_weighting * cost
 
                 constant += (cost * n.static(c)[attr][ext_i]).sum()
-            # breakpoint()
+
             if constant != 0:
                 object_const = m.add_variables(
                     constant,
                     constant,
                     name="constraint_constant",
-                )  ## TODO --this may not be needed
+                )  ## TODO --this may not be needed, if it is we need to find a way to add it in the constraint (extra loop)
                 constraint.append(-1 * object_const)
 
             # Weightings
@@ -290,7 +290,7 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
                     if cost.empty:
                         continue
                     operation = m[f"{c}-{attr}"].sel({"snapshot": sns, c: cost.columns})
-                    constraint.append((operation * cost).sum())
+                    constraint = (operation * cost).sum()
 
             # stand-by cost
             comps = {"Generator", "Link"}
@@ -307,7 +307,7 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
                 )
                 stand_by_cost.columns.name = f"{c}-com"
                 status = n.model.variables[f"{c}-status"].loc[:, stand_by_cost.columns]
-                constraint.append((status * stand_by_cost).sum())
+                linopy.expressions.merge([constraint, (status * stand_by_cost).sum()])
 
             # investment
             for c, attr in nominal_attrs.items():
@@ -323,7 +323,7 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
                 cost = active @ period_weighting * cost
 
                 caps = m[f"{c}-{attr}"]
-                constraint.append((caps * cost).sum())
+                linopy.expressions.merge([constraint, (caps * cost).sum()])
 
             # unit commitment
             keys = ["start_up", "shut_down"]  # noqa: F841
@@ -333,29 +333,23 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
 
                 if cost.sum():
                     var = m[f"{c}-{attr}"]
-                    constraint.append((var * cost).sum())
+                    linopy.expressions.merge([constraint, (var * cost).sum()])  # constraint.append((var * cost).sum())
 
             lhs = constraint
 
-            #######FROM OBJ FUNCTION ########
-
             ## assign this value to the rhs of the constraint
-            rhs = int(-region_cost_lim)
+            rhs = region_cost_lim
             ## create the lhs of the constraint
-            lhs = lhs  ##nat or interc or iso level
-            ## add the constraint to the network
-        # breakpoint()
-        import linopy
 
-        lhs_full = linopy.expressions.merge([lhs[x] for x in range(0, len(lhs))])
-        n.model.add_constraints(
-            lhs_full == rhs,
-            name=f"GlobalConstraint-{region}_{periods}_constant_cost",
-        )
-
-        logger.info(
-            f"Adding regional cost Limit for {region} in {periods}",
-        )
+    # add the constraint
+    n.model.add_constraints(
+        lhs == rhs,
+        name=f"GlobalConstraint-{region}_{periods.values[0]}_constant_cost",
+    )
+    # breakpoint()
+    logger.info(
+        f"Adding regional cost Limit for {region} in {periods}",
+    )
 
 
 def add_technology_capacity_target_constraints(n, config):
@@ -1742,30 +1736,33 @@ def solve_network(n, config, solving, opts="", **kwargs):
                         n.remove(nm, c_idx)
                     for df_idx in df.index:
                         if nm == "Generator":
-                            n.madd(
-                                nm,
-                                [df_idx],
-                                carrier=df.loc[df_idx].carrier,
-                                bus=df.loc[df_idx].bus,
-                                p_nom_min=df.loc[df_idx].p_nom_min,
-                                p_nom=df.loc[df_idx].p_nom,
-                                p_nom_max=df.loc[df_idx].p_nom_max,
-                                p_nom_extendable=df.loc[df_idx].p_nom_extendable,
-                                ramp_limit_up=df.loc[df_idx].ramp_limit_up,
-                                ramp_limit_down=df.loc[df_idx].ramp_limit_down,
-                                efficiency=df.loc[df_idx].efficiency,
-                                marginal_cost=df.loc[df_idx].marginal_cost,
-                                capital_cost=df.loc[df_idx].capital_cost,
-                                build_year=df.loc[df_idx].build_year,
-                                lifetime=df.loc[df_idx].lifetime,
-                                heat_rate=df.loc[df_idx].heat_rate,
-                                fuel_cost=df.loc[df_idx].fuel_cost,
-                                vom_cost=df.loc[df_idx].vom_cost,
-                                carrier_base=df.loc[df_idx].carrier_base,
-                                p_min_pu=df.loc[df_idx].p_min_pu,
-                                p_max_pu=df.loc[df_idx].p_max_pu,
-                                land_region=df.loc[df_idx].land_region,
-                            )
+                            # breakpoint()
+                            n.add(nm, df_idx, **df.loc[df_idx])
+
+                            # n.madd(
+                            #     nm,
+                            #     [df_idx],
+                            #     carrier=df.loc[df_idx].carrier,
+                            #     bus=df.loc[df_idx].bus,
+                            #     p_nom_min=df.loc[df_idx].p_nom_min,
+                            #     p_nom=df.loc[df_idx].p_nom,
+                            #     p_nom_max=df.loc[df_idx].p_nom_max,
+                            #     p_nom_extendable=df.loc[df_idx].p_nom_extendable,
+                            #     ramp_limit_up=df.loc[df_idx].ramp_limit_up,
+                            #     ramp_limit_down=df.loc[df_idx].ramp_limit_down,
+                            #     efficiency=df.loc[df_idx].efficiency,
+                            #     marginal_cost=df.loc[df_idx].marginal_cost,
+                            #     capital_cost=df.loc[df_idx].capital_cost,
+                            #     build_year=df.loc[df_idx].build_year,
+                            #     lifetime=df.loc[df_idx].lifetime,
+                            #     heat_rate=df.loc[df_idx].heat_rate,
+                            #     fuel_cost=df.loc[df_idx].fuel_cost,
+                            #     vom_cost=df.loc[df_idx].vom_cost,
+                            #     carrier_base=df.loc[df_idx].carrier_base,
+                            #     p_min_pu=df.loc[df_idx].p_min_pu,
+                            #     p_max_pu=df.loc[df_idx].p_max_pu,
+                            #     land_region=df.loc[df_idx].land_region,
+                            # )
                         else:
                             n.add(nm, df_idx, **df.loc[df_idx])
                     logger.info(n.consistency_check())
