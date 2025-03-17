@@ -181,7 +181,7 @@ def prepare_network(
     if solve_opts.get("nhours"):
         nhours = solve_opts["nhours"]
         n.set_snapshots(n.snapshots[:nhours])
-        n.snapshot_weightings[:] = 8760.0 / nhours
+        n.snapshot_weightings[:] = 24.0 * 10 / nhours
 
     return n
 
@@ -220,8 +220,11 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
 
         if existing_data == True:
             logger.info("Using existing data inputs for constant cost constraint")
-            region_cost_lim = pd.read_csv(config["electricity"]["cost_constraints"])
-
+            existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
+            region_cost_lim = (existing_n.statistics.opex().sum() + existing_n.statistics.capex().sum()).values[
+                0
+            ]  # existing_n.objective + existing_n.objective_constant
+            # breakpoint()
         elif existing_data == False:
 
             if sns.unique("period") == n.investment_periods[0]:
@@ -233,41 +236,66 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
             )
 
             ## RHS
-            region_cost_lim = n.objective
+            region_cost_lim = n.objective + n.objective_constant
 
-            ## LHS
-            ## TODO --add regional breakdown
+        ## TODO --add regional breakdown
 
-            m = n.model
+        m = n.model
 
-            periods = sns.unique("period")
-            period_weighting = n.investment_period_weightings.objective[periods]
+        periods = sns.unique("period")
+        period_weighting = n.investment_period_weightings.objective[periods]
 
-            # constant for already done investment
-            nom_attr = nominal_attrs.items()
-            constant = 0
-            for c, attr in nom_attr:
-                ext_i = n.get_extendable_i(c)
-                cost = n.static(c)["capital_cost"][ext_i]
-                if cost.empty:
-                    continue
+        # constant for already done investment
+        # nom_attr = nominal_attrs.items()
+        constant = 0
+        # for c, attr in nom_attr:
+        #     ext_i = n.get_extendable_i(c)
+        #     cost = n.static(c)["capital_cost"][ext_i]
+        #     if cost.empty:
+        #         continue
 
-                active = pd.concat(
-                    {period: n.get_active_assets(c, period)[ext_i] for period in sns.unique("period")},
-                    axis=1,
-                )
-                cost = active @ period_weighting * cost
+        #     active = pd.concat(
+        #         {period: n.get_active_assets(c, period)[ext_i] for period in sns.unique("period")},
+        #         axis=1,
+        #     )
+        #     cost = active @ period_weighting * cost
 
-                constant += (cost * n.static(c)[attr][ext_i]).sum()
+        #     constant += (cost * n.static(c)[attr][ext_i]).sum()
 
-            if constant != 0:
-                object_const = m.add_variables(
-                    constant,
-                    constant,
-                    name="constraint_constant",
-                )  ## TODO --this may not be needed, if it is we need to find a way to add it in the constraint (extra loop)
-                constraint.append(-1 * object_const)
+        if constant != 0:
+            object_const = m.add_variables(
+                constant,
+                constant,
+                name="constraint_constant",
+            )  ## TODO --this may not be needed, if it is we need to find a way to add it in the constraint (extra loop)
 
+            constraint = -1 * object_const
+
+            # Weightings
+            weighting = n.snapshot_weightings.objective
+            weighting = weighting.mul(period_weighting, level=0).loc[sns]
+
+            lookup = pd.read_csv(
+                os.path.join(
+                    os.path.expanduser("~"),
+                    "Documents",
+                    "PyPSA",
+                    "pypsa",
+                    "variables.csv",
+                ),  ## TODO, hacky, is specific to my own setup
+                index_col=["component", "variable"],
+            )
+
+            # marginal costs, marginal storage cost, and spill cost
+            for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
+                for c, attr in lookup.query(cost_type).index:
+                    cost = get_as_dense(n, c, cost_type, sns).loc[:, lambda ds: (ds != 0).any()].mul(weighting, axis=0)
+                    if cost.empty:
+                        continue
+                    operation = m[f"{c}-{attr}"].sel({"snapshot": sns, c: cost.columns})
+                    linopy.expressions.merge([constraint, (operation * cost).sum()])
+
+        elif constant == 0:
             # Weightings
             weighting = n.snapshot_weightings.objective
             weighting = weighting.mul(period_weighting, level=0).loc[sns]
@@ -292,61 +320,61 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
                     operation = m[f"{c}-{attr}"].sel({"snapshot": sns, c: cost.columns})
                     constraint = (operation * cost).sum()
 
-            # stand-by cost
-            comps = {"Generator", "Link"}
-            for c in comps:
-                com_i = get_committable_i(n, c)
+        # stand-by cost
+        comps = {"Generator", "Link"}
+        for c in comps:
+            com_i = get_committable_i(n, c)
 
-                if com_i.empty:
-                    continue
+            if com_i.empty:
+                continue
 
-                stand_by_cost = (
-                    get_as_dense(n, c, "stand_by_cost", sns, com_i)
-                    .loc[:, lambda ds: (ds != 0).any()]
-                    .mul(weighting, axis=0)
-                )
-                stand_by_cost.columns.name = f"{c}-com"
-                status = n.model.variables[f"{c}-status"].loc[:, stand_by_cost.columns]
-                linopy.expressions.merge([constraint, (status * stand_by_cost).sum()])
+            stand_by_cost = (
+                get_as_dense(n, c, "stand_by_cost", sns, com_i)
+                .loc[:, lambda ds: (ds != 0).any()]
+                .mul(weighting, axis=0)
+            )
+            stand_by_cost.columns.name = f"{c}-com"
+            status = n.model.variables[f"{c}-status"].loc[:, stand_by_cost.columns]
+            linopy.expressions.merge([constraint, (status * stand_by_cost).sum()])
 
-            # investment
-            for c, attr in nominal_attrs.items():
-                ext_i = n.get_extendable_i(c)
-                cost = n.static(c)["capital_cost"][ext_i]
-                if cost.empty:
-                    continue
+        # investment
+        for c, attr in nominal_attrs.items():
+            ext_i = n.get_extendable_i(c)
+            cost = n.static(c)["capital_cost"][ext_i]
+            if cost.empty:
+                continue
 
-                active = pd.concat(
-                    {period: n.get_active_assets(c, period)[ext_i] for period in sns.unique("period")},
-                    axis=1,
-                )
-                cost = active @ period_weighting * cost
+            active = pd.concat(
+                {period: n.get_active_assets(c, period)[ext_i] for period in sns.unique("period")},
+                axis=1,
+            )
+            cost = active @ period_weighting * cost
 
-                caps = m[f"{c}-{attr}"]
-                linopy.expressions.merge([constraint, (caps * cost).sum()])
+            caps = m[f"{c}-{attr}"]
+            linopy.expressions.merge([constraint, (caps * cost).sum()])
 
-            # unit commitment
-            keys = ["start_up", "shut_down"]  # noqa: F841
-            for c, attr in lookup.query("variable in @keys").index:
-                com_i = n.get_committable_i(c)
-                cost = n.static(c)[attr + "_cost"].reindex(com_i)
+        # unit commitment
+        keys = ["start_up", "shut_down"]  # noqa: F841
+        for c, attr in lookup.query("variable in @keys").index:
+            com_i = n.get_committable_i(c)
+            cost = n.static(c)[attr + "_cost"].reindex(com_i)
 
-                if cost.sum():
-                    var = m[f"{c}-{attr}"]
-                    linopy.expressions.merge([constraint, (var * cost).sum()])  # constraint.append((var * cost).sum())
+            if cost.sum():
+                var = m[f"{c}-{attr}"]
+                linopy.expressions.merge([constraint, (var * cost).sum()])  # constraint.append((var * cost).sum())
 
-            lhs = constraint
+        lhs = constraint
 
-            ## assign this value to the rhs of the constraint
-            rhs = region_cost_lim
-            ## create the lhs of the constraint
-
+        ## assign this value to the rhs of the constraint
+        rhs = region_cost_lim
+        ## create the lhs of the constraint
+    # breakpoint()
     # add the constraint
     n.model.add_constraints(
-        lhs == rhs,
+        lhs <= rhs,
         name=f"GlobalConstraint-{region}_{periods.values[0]}_constant_cost",
     )
-    # breakpoint()
+
     logger.info(
         f"Adding regional cost Limit for {region} in {periods}",
     )
@@ -1683,6 +1711,7 @@ def solve_network(n, config, solving, opts="", **kwargs):
         "linearized_unit_commitment",
         False,
     )
+    kwargs["opt_type"] = config["optimization_type"]
     kwargs["assign_all_duals"] = cf_solving.get("assign_all_duals", False)
 
     rolling_horizon = cf_solving.pop("rolling_horizon", False)

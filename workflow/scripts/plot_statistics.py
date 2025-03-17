@@ -820,16 +820,16 @@ def plot_region_lmps(
     df_long.drop(columns="timestep", inplace=True)
     df_long["region"] = df_long.bus.map(n.buses.country)
 
-    plt.figure(figsize=(10, 10))
-
-    sns.boxplot(
-        df_long,
-        x="lmp",
-        y="region",
-        width=0.5,
-        fliersize=0.5,
-        linewidth=1,
-    )
+    # plt.figure(figsize=(10, 10))
+    # breakpoint()
+    # sns.boxplot(
+    #     df_long,
+    #     x="lmp",
+    #     y="region",
+    #     width=0.5,
+    #     fliersize=0.5,
+    #     linewidth=1,
+    # )
 
     plt.title(create_title("LMPs by Region", **wildcards))
     plt.xlabel("LMP [$/MWh]")
@@ -858,18 +858,22 @@ def plot_fuel_costs(
 
     # plot error plot of all fuels
     df = fuel_costs.droplevel(["bus", "Generator"]).T.resample("d").mean().reset_index().melt(id_vars="timestep")
+    if len(fuels) > 1:
+        ax = axs[0]
+    else:
+        ax = axs
     sns.lineplot(
         data=df,
         x="timestep",
         y="value",
         hue="carrier",
-        ax=axs[0],
+        ax=ax,  ###LF MODIFIED FOR SINGLE TESTING
         legend=True,
         palette=color_palette,
     )
-    axs[0].set_title("Daily Average Fuel Costs [$/MWh]"),
-    axs[0].set_xlabel(""),
-    axs[0].set_ylabel("$/MWh"),
+    ax.set_title("Daily Average Fuel Costs [$/MWh]"),  ###LF MODIFIED FOR SINGLE TESTING
+    ax.set_xlabel(""),  ###LF MODIFIED FOR SINGLE TESTING
+    ax.set_ylabel("$/MWh"),  ###LF MODIFIED FOR SINGLE TESTING
 
     # plot bus fuel prices for each fuel
     for i, fuel in enumerate(fuels):
