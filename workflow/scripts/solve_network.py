@@ -1689,33 +1689,30 @@ def solve_network(n, config, solving, opts="", **kwargs):
                         n.remove(nm, c_idx)
                     for df_idx in df.index:
                         if nm == "Generator":
-                            # breakpoint()
-                            n.add(nm, df_idx, **df.loc[df_idx])
-
-                            # n.madd(
-                            #     nm,
-                            #     [df_idx],
-                            #     carrier=df.loc[df_idx].carrier,
-                            #     bus=df.loc[df_idx].bus,
-                            #     p_nom_min=df.loc[df_idx].p_nom_min,
-                            #     p_nom=df.loc[df_idx].p_nom,
-                            #     p_nom_max=df.loc[df_idx].p_nom_max,
-                            #     p_nom_extendable=df.loc[df_idx].p_nom_extendable,
-                            #     ramp_limit_up=df.loc[df_idx].ramp_limit_up,
-                            #     ramp_limit_down=df.loc[df_idx].ramp_limit_down,
-                            #     efficiency=df.loc[df_idx].efficiency,
-                            #     marginal_cost=df.loc[df_idx].marginal_cost,
-                            #     capital_cost=df.loc[df_idx].capital_cost,
-                            #     build_year=df.loc[df_idx].build_year,
-                            #     lifetime=df.loc[df_idx].lifetime,
-                            #     heat_rate=df.loc[df_idx].heat_rate,
-                            #     fuel_cost=df.loc[df_idx].fuel_cost,
-                            #     vom_cost=df.loc[df_idx].vom_cost,
-                            #     carrier_base=df.loc[df_idx].carrier_base,
-                            #     p_min_pu=df.loc[df_idx].p_min_pu,
-                            #     p_max_pu=df.loc[df_idx].p_max_pu,
-                            #     land_region=df.loc[df_idx].land_region,
-                            # )
+                            n.madd(
+                                nm,
+                                [df_idx],
+                                carrier=df.loc[df_idx].carrier,
+                                bus=df.loc[df_idx].bus,
+                                p_nom_min=df.loc[df_idx].p_nom_min,
+                                p_nom=df.loc[df_idx].p_nom,
+                                p_nom_max=df.loc[df_idx].p_nom_max,
+                                p_nom_extendable=df.loc[df_idx].p_nom_extendable,
+                                ramp_limit_up=df.loc[df_idx].ramp_limit_up,
+                                ramp_limit_down=df.loc[df_idx].ramp_limit_down,
+                                efficiency=df.loc[df_idx].efficiency,
+                                marginal_cost=df.loc[df_idx].marginal_cost,
+                                capital_cost=df.loc[df_idx].capital_cost,
+                                build_year=df.loc[df_idx].build_year,
+                                lifetime=df.loc[df_idx].lifetime,
+                                heat_rate=df.loc[df_idx].heat_rate,
+                                fuel_cost=df.loc[df_idx].fuel_cost,
+                                vom_cost=df.loc[df_idx].vom_cost,
+                                carrier_base=df.loc[df_idx].carrier_base,
+                                p_min_pu=df.loc[df_idx].p_min_pu,
+                                p_max_pu=df.loc[df_idx].p_max_pu,
+                                land_region=df.loc[df_idx].land_region,
+                            )
                         else:
                             n.add(nm, df_idx, **df.loc[df_idx])
                     logger.info(n.consistency_check())
@@ -1727,6 +1724,12 @@ def solve_network(n, config, solving, opts="", **kwargs):
 
                     for tattr in n.component_attrs[nm].index[selection]:
                         n.import_series_from_dataframe(time_df[tattr], nm, tattr)
+
+                # roll over the last snapshot of time varying storage state of charge to be the state_of_charge_initial for the next time period
+                n.storage_units.loc[:, "state_of_charge_initial"] = n.storage_units_t.state_of_charge.loc[
+                    planning_horizon
+                ].iloc[-1]
+
         case _:
             raise ValueError(f"Invalid foresight option: '{foresight}'. Must be 'perfect' or 'myopic'.")
 
