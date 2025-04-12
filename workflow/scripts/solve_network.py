@@ -186,80 +186,330 @@ def prepare_network(
     return n
 
 
+# def add_constant_cost_constraints(n, sns, config, existing_data):
+#     """
+#     Add a constant cost constraint to the network.
+
+#     This function adds a constraint to the network to ensure that the total
+#     cost of the network in a given region is equal to a constant value.
+
+#     Parameters
+#     ----------
+#     n : pypsa.Network
+#         The PyPSA network object.
+#     config : dict
+#         A dictionary containing configuration settings and file paths.
+
+#     Returns
+#     -------
+#     None
+#     """
+#     logger.info("Adding constant cost constraint.")
+
+#     foresight = config["foresight"]
+#     logger.info(f"Using {foresight} foresight")
+#     region = "national"  ## TODO --add regional breakdown
+#     periods = sns.unique("period")
+#     ## reinitialize the model to get the current build
+#     n.optimize(**kwargs)
+
+#     ## RHS depends on the foresight and/or if existing data is being used
+#     if foresight == "perfect":
+
+#         logger.info("Using existing data inputs for constant cost constraint")
+#         logger.info("Using existing data inputs for constant cost constraint")
+#         existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
+#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex() #existing_n.objective + existing_n.objective_constant #scale to billions
+#         region_cost_lim = region_cost_lim[2030].sum()
+#     elif foresight == "myopic":
+#         ## Sum costs from previous simulation or from the first time step (TBD)
+#         ## give option to input a file or to have it from previous simulation
+#         logger.info("Myopic")
+
+#         if existing_data == True:
+#             logger.info("Using existing data inputs for constant cost constraint")
+#             existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
+#             region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex() #existing_n.objective + existing_n.objective_constant #scale to billions 11207629416.75982#/scale_factor #
+#             region_cost_lim = region_cost_lim[2030].sum()
+#         elif existing_data == False:
+
+#             if sns.unique("period") == n.investment_periods[0]:
+#                 # logger.info(f"First time horizon {sns}, do not apply constraint")
+#                 return
+
+#             logger.info(
+#                 "No existing data to use for constant cost constraint, using first time step from myopic run for {sns}",
+#             )
+
+#             ## RHS
+#             region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex() #n.objective + n.objective_constant
+
+#     ## assign rhs as one to reduce the size, constraint is relative to this
+#     rhs = 1.0 #region_cost_lim
+
+#     ## LHS is the original m.objective.expression
+#     if not hasattr(n, '_original_cost_objective'):
+#         logger.info("Creating cost objective expression and storing it for constraint")
+#         n._original_cost_objective = n.model.objective.expression
+
+#     lhs = n._original_cost_objective/region_cost_lim #scale to the RHS
+
+#     # add the constraint
+
+#     n.model.add_constraints(
+#         lhs <= rhs * 1,
+#         name=f"GlobalConstraint-{region}_{periods.values[0]}_constant_cost",
+#     )
+#     #breakpoint()
+#     logger.info(
+#         f"Adding cost Limit for {region} in {periods.values[0]}",
+#     )
+#     logger.info(
+#         f"COST LIMIT VAR SUM IS {lhs.vars.sum()} and COEFFS SUM IS {lhs.coeffs.sum()}"
+#    )
+
+
 def add_constant_cost_constraints(n, sns, config, existing_data):
     """
-    Add a constant cost constraint to the network.
-
-    This function adds a constraint to the network to ensure that the total
-    cost of the network in a given region is equal to a constant value.
-
-    Parameters
-    ----------
-    n : pypsa.Network
-        The PyPSA network object.
-    config : dict
-        A dictionary containing configuration settings and file paths.
-
-    Returns
-    -------
-    None
+    Add a constant cost constraint to the network using create_model for efficiency.
     """
     logger.info("Adding constant cost constraint.")
 
     foresight = config["foresight"]
     logger.info(f"Using {foresight} foresight")
-    region = "national"  ## TODO --add regional breakdown
+    region = "national"
     periods = sns.unique("period")
-    # period_weighting = n.investment_period_weightings.objective[periods]
+    current_period = periods.values[0]
 
-    ## RHS depends on the foresight and/or if existing data is being used
-    if foresight == "perfect":
-
-        logger.info("Using existing data inputs for constant cost constraint")
+    # Calculate reference cost limit
+    if existing_data:
         logger.info("Using existing data inputs for constant cost constraint")
         existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
         region_cost_lim = existing_n.objective + existing_n.objective_constant
+        # breakpoint()#existing_n.statistics.capex() + existing_n.statistics.opex()
+        # region_cost_lim = region_cost_lim[2030].sum()
+    elif current_period == n.investment_periods[0]:
+        logger.info("First time horizon, no cost constraint needed")
+        return
+    else:
+        logger.info("No existing data to use for constant cost constraint, using first time step from myopic run")
+        region_cost_lim = n.statistics.capex() + n.statistics.opex()
+        # Make sure we're getting the right period's cost
+        region_cost_lim = region_cost_lim[current_period].sum()
 
-    elif foresight == "myopic":
-        ## Sum costs from previous simulation or from the first time step (TBD)
-        ## give option to input a file or to have it from previous simulation
-        logger.info("Myopic")
+    # Always recreate the cost objective for the current period
+    logger.info(f"Creating cost objective expression for period {current_period}")
 
-        if existing_data == True:
-            logger.info("Using existing data inputs for constant cost constraint")
-            existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
-            region_cost_lim = existing_n.objective + existing_n.objective_constant
-            #
-        elif existing_data == False:
+    # Create a temporary network to get a clean cost objective
+    temp_n = pypsa.Network(snakemake.input.network)
 
-            if sns.unique("period") == n.investment_periods[0]:
-                # logger.info(f"First time horizon {sns}, do not apply constraint")
-                return
+    # Apply essential preparation to temp_n
+    temp_n = prepare_network(
+        temp_n,
+        config["solving"]["options"],
+        config=config,
+        foresight=foresight,
+        planning_horizons=config["scenario"]["planning_horizons"],
+    )
 
-            logger.info(
-                "No existing data to use for constant cost constraint, using first time step from myopic run for {sns}",
-            )
+    # Just create the model, don't optimize
+    temp_model = pypsa.optimization.create_model(temp_n, sns)
 
-            ## RHS
-            region_cost_lim = n.objective + n.objective_constant
+    # Extract the objective expression for this period
+    original_cost_objective = temp_model.objective.expression
 
-    ## assign this value to the rhs of the constraint
-    rhs = region_cost_lim
+    # Clean up to free memory
+    del temp_n
+    del temp_model
 
-    ## LHS is the original m.objective.expression
-    m = n.model
+    # Define right-hand side and constraint parameters
+    rhs = 1.0
+    multiplier = 1.0001  # Small margin for numerical stability
 
-    lhs = m.objective.expression
-
-    # add the constraint
+    # Add the constraint with the original cost objective
     n.model.add_constraints(
-        lhs <= rhs,
-        name=f"GlobalConstraint-{region}_{periods.values[0]}_constant_cost",
+        original_cost_objective / region_cost_lim <= rhs * multiplier,
+        name=f"GlobalConstraint-{region}_{current_period}_constant_cost",
     )
+    logger.info(f"Original cost objective coeffs sum: {original_cost_objective.coeffs.sum()} ")
+    logger.info(f"Adding cost limit for {region} in {current_period} with multiplier {multiplier}")
+    logger.info(f"Cost limit value: {region_cost_lim}")
 
-    logger.info(
-        f"Adding regional cost Limit for {region} in {periods}",
-    )
+
+######## WORKING BUT WRONG ##########
+# def add_constant_cost_constraints(n, sns, config, existing_data):
+#     """
+#     Add a constant cost constraint to the network.
+#     """
+#     logger.info("Adding constant cost constraint.")
+
+#     foresight = config["foresight"]
+#     logger.info(f"Using {foresight} foresight")
+#     region = "national"
+#     periods = sns.unique("period")
+
+#     # Create a clean copy of the network for optimization
+#     temp_n = pypsa.Network(snakemake.input.network)
+
+#     # Apply only essential preparation to temp_n (no CO2 objective)
+#     temp_n = prepare_network(
+#         temp_n,
+#         config["solving"]["options"],
+#         config=config,
+#         foresight=foresight,
+#         planning_horizons=config["scenario"]["planning_horizons"],
+#     )
+
+#     # Create solver options for temporary optimization
+#     solver_options = {}
+#     if "solver_options" in config["solving"]:
+#         solver_name = config["solving"]["solver"]["name"]
+#         options_set = config["solving"]["solver"]["options"]
+#         if options_set:
+#             solver_options = config["solving"]["solver_options"][options_set]
+
+#     temp_n.optimize(solver_name =solver_name, solver_options=solver_options, keep_files=False)
+
+#     # Now we have a model with the correct cost objective structure
+#     cost_objective = temp_n.model.objective.expression
+
+#     # Calculate reference cost limit
+#     if existing_data == True:
+#         logger.info("Using existing data inputs for constant cost constraint")
+#         existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
+#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex()
+#         region_cost_lim = region_cost_lim[2030].sum()
+#     elif existing_data == False:
+#         if sns.unique("period") == n.investment_periods[0]:
+#             return
+#         logger.info(
+#             "No existing data to use for constant cost constraint, using first time step from myopic run"
+#         )
+#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex()
+
+#     # Define right-hand side
+#     rhs = 1.0
+
+#     # Store the cost objective expression in our original network
+#     n._original_cost_objective = cost_objective
+
+#     # Create a simple multiplication of the cost objective
+#     # This avoids the complex mapping between different models
+#     multiplier = 1.0  # Start with higher value to ensure feasibility
+
+#     # Add the constraint with the original cost objective
+#     n.model.add_constraints(
+#         n._original_cost_objective / region_cost_lim <= rhs * multiplier,
+#         name=f"GlobalConstraint-{region}_{periods.values[0]}_constant_cost"
+#     )
+
+#     logger.info(f"Adding cost Limit for {region} in {periods.values[0]} with multiplier {multiplier}")
+# def map_expression(expr, var_map):
+#     """
+#     Maps variables in an expression to their counterparts in another model.
+
+#     Parameters:
+#     -----------
+#     expr : linopy expression
+#         The expression containing variables to be mapped
+#     var_map : dict
+#         Dictionary mapping variables from source model to target model
+
+#     Returns:
+#     --------
+#     mapped_expr : linopy expression
+#         The expression with variables mapped to the target model
+#     """
+#     # This is a simplified implementation - you may need to adjust based on
+#     # how linopy expressions are structured internally
+
+#     # Create a new expression with the same structure but mapped variables
+#     new_terms = []
+
+#     for term in expr.terms:
+#         if term.var in var_map:
+#             new_var = var_map[term.var]
+#             new_term = term.coeff * new_var
+#             new_terms.append(new_term)
+#         else:
+#             # For constants or unmapped variables, keep as is
+#             new_terms.append(term)
+
+#     # Sum the terms to create the new expression
+#     if new_terms:
+#         return sum(new_terms)
+#     else:
+#         return 0
+
+# def add_constant_cost_constraints(n, sns, config, existing_data):
+#     """
+#     Add a constant cost constraint to the network using manual cost definition.
+#     """
+#     logger.info("Adding constant cost constraint.")
+
+#     foresight = config["foresight"]
+#     logger.info(f"Using {foresight} foresight")
+#     region = "national"
+#     periods = sns.unique("period")
+
+#     # Calculate reference cost limit
+#     if existing_data == True:
+#         logger.info("Using existing data inputs for constant cost constraint")
+#         existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
+#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex()
+#         region_cost_lim = region_cost_lim[2030].sum()
+#     elif existing_data == False:
+#         if sns.unique("period") == n.investment_periods[0]:
+#             return
+#         logger.info(
+#             "No existing data to use for constant cost constraint, using first time step from myopic run"
+#         )
+#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex()
+
+#     # Define right-hand side
+#     rhs = 1.0
+#     multiplier = 1.02  # Higher value for feasibility
+
+#     # Manually create a cost expression
+#     total_cost = 0
+
+#     # Generator capital costs
+#     ext_gens = n.generators.query('p_nom_extendable')
+#     if not ext_gens.empty:
+#         gen_cap_cost = n.model['Generator-p_nom'].loc[ext_gens.index] * ext_gens.capital_cost
+#         total_cost += gen_cap_cost.sum()
+
+#     # Generator operational costs
+#     for gen_name, gen in n.generators.iterrows():
+#         if gen_name in n.model['Generator-p'].coords['Generator'].values:
+#             p = n.model['Generator-p'].sel(Generator=gen_name)
+#             w = n.snapshot_weightings.objective
+#             total_cost += (p * w * gen.marginal_cost).sum()
+
+#     # Storage unit capital costs
+#     ext_storage = n.storage_units.query('p_nom_extendable')
+#     if not ext_storage.empty:
+#         sto_cap_cost = n.model['StorageUnit-p_nom'].loc[ext_storage.index] * ext_storage.capital_cost
+#         total_cost += sto_cap_cost.sum()
+
+#     # Link capital costs
+#     ext_links = n.links.query('p_nom_extendable')
+#     if not ext_links.empty:
+#         link_cap_cost = n.model['Link-p_nom'].loc[ext_links.index] * ext_links.capital_cost
+#         total_cost += link_cap_cost.sum()
+
+#     # Save this as the original cost objective
+#    # n._original_cost_objective = total_cost
+
+#     # Define LHS and apply constraint
+#     lhs = total_cost / region_cost_lim
+#     #breakpoint()
+#     n.model.add_constraints(
+#         lhs <= rhs * multiplier,
+#         name=f"GlobalConstraint-{region}_{periods.values[0]}_constant_cost",
+#     )
+
+#     logger.info(f"Adding cost Limit for {region} in {periods.values[0]} with multiplier {multiplier}")
 
 
 def define_objective_co2(n, sns):
@@ -437,6 +687,7 @@ def add_technology_capacity_target_constraints(n, config):
                 target.carrier,
                 (target["max"]),
             )
+        # breakpoint()
 
 
 def add_RPS_constraints(n, sns, config):
@@ -1599,6 +1850,7 @@ def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
         kwargs["overlap"] = cf_solving.get("overlap", 0)
         n.optimize.optimize_with_rolling_horizon(**kwargs)
         status, condition = "", ""
+
     elif skip_iterations:
         status, condition = n.optimize(**kwargs)
     else:
