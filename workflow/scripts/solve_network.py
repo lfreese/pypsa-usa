@@ -43,6 +43,7 @@ from _helpers import (
 )
 from constants import NG_MWH_2_MMCF
 from eia import Trade
+from linopy import Model, merge
 from pypsa.descriptors import get_committable_i
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 from pypsa.descriptors import nominal_attrs
@@ -186,92 +187,104 @@ def prepare_network(
     return n
 
 
-# def add_constant_cost_constraints(n, sns, config, existing_data):
-#     """
-#     Add a constant cost constraint to the network.
+import numpy as np
+import pandas as pd
+from pypsa.descriptors import get_committable_i
+from pypsa.descriptors import get_switchable_as_dense as get_as_dense
+from pypsa.descriptors import nominal_attrs
 
-#     This function adds a constraint to the network to ensure that the total
-#     cost of the network in a given region is equal to a constant value.
+lookup = pd.read_csv(
+    os.path.join(os.path.dirname(__file__), "..", "variables.csv"),
+    index_col=["component", "variable"],
+)
 
-#     Parameters
-#     ----------
-#     n : pypsa.Network
-#         The PyPSA network object.
-#     config : dict
-#         A dictionary containing configuration settings and file paths.
 
-#     Returns
-#     -------
-#     None
-#     """
-#     logger.info("Adding constant cost constraint.")
+def calculate_total_cost(n):
+    """Calculate total cost in the same way as the objective function"""
+    total_cost = 0
 
-#     foresight = config["foresight"]
-#     logger.info(f"Using {foresight} foresight")
-#     region = "national"  ## TODO --add regional breakdown
-#     periods = sns.unique("period")
-#     ## reinitialize the model to get the current build
-#     n.optimize(**kwargs)
+    # Get weightings
+    weightings = n.snapshot_weightings.objective
 
-#     ## RHS depends on the foresight and/or if existing data is being used
-#     if foresight == "perfect":
+    # 1. Capital costs (capex)
+    for c, attr in nominal_attrs.items():
+        ext_i = n.get_extendable_i(c)
+        cost = n.df(c)["capital_cost"][ext_i]
+        if cost.empty:
+            continue
 
-#         logger.info("Using existing data inputs for constant cost constraint")
-#         logger.info("Using existing data inputs for constant cost constraint")
-#         existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
-#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex() #existing_n.objective + existing_n.objective_constant #scale to billions
-#         region_cost_lim = region_cost_lim[2030].sum()
-#     elif foresight == "myopic":
-#         ## Sum costs from previous simulation or from the first time step (TBD)
-#         ## give option to input a file or to have it from previous simulation
-#         logger.info("Myopic")
+        # Get the optimal capacity values
+        caps = n.df(c)[f"{attr}_opt"][ext_i]
+        total_cost += (caps * cost).sum()
 
-#         if existing_data == True:
-#             logger.info("Using existing data inputs for constant cost constraint")
-#             existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
-#             region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex() #existing_n.objective + existing_n.objective_constant #scale to billions 11207629416.75982#/scale_factor #
-#             region_cost_lim = region_cost_lim[2030].sum()
-#         elif existing_data == False:
+    # 2. Operational costs (opex)
+    # Marginal costs, marginal storage cost, and spill cost
+    for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
+        for c, attr in lookup.query(cost_type).index:
+            cost = n.df(c)[cost_type]
+            if cost.empty:
+                continue
 
-#             if sns.unique("period") == n.investment_periods[0]:
-#                 # logger.info(f"First time horizon {sns}, do not apply constraint")
-#                 return
+            # Get the operational values - handle different component types
+            if c == "Generator":
+                operation = n.pnl(c)["p"]
+            elif c == "StorageUnit":
+                operation = n.pnl(c)["p_dispatch"] - n.pnl(c)["p_store"]
+            elif c == "Store":
+                operation = n.pnl(c)["p"]
+            elif c == "Link":
+                operation = n.pnl(c)["p0"]
+            else:
+                continue
 
-#             logger.info(
-#                 "No existing data to use for constant cost constraint, using first time step from myopic run for {sns}",
-#             )
+            if operation.empty:
+                continue
 
-#             ## RHS
-#             region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex() #n.objective + n.objective_constant
+            # Weight the operations
+            weighted_operation = operation.mul(weightings, axis=0)
+            total_cost += (weighted_operation * cost).sum().sum()
 
-#     ## assign rhs as one to reduce the size, constraint is relative to this
-#     rhs = 1.0 #region_cost_lim
+    # 3. Stand-by costs
+    comps = {"Generator", "Link"}
+    for c in comps:
+        com_i = get_committable_i(n, c)
+        if com_i.empty:
+            continue
 
-#     ## LHS is the original m.objective.expression
-#     if not hasattr(n, '_original_cost_objective'):
-#         logger.info("Creating cost objective expression and storing it for constraint")
-#         n._original_cost_objective = n.model.objective.expression
+        stand_by_cost = n.df(c)["stand_by_cost"][com_i]
+        if stand_by_cost.empty:
+            continue
 
-#     lhs = n._original_cost_objective/region_cost_lim #scale to the RHS
+        # Get the status values
+        status = n.pnl(c)["status"]
+        if status.empty:
+            continue
 
-#     # add the constraint
+        # Weight the status
+        weighted_status = status.mul(weightings, axis=0)
+        total_cost += (weighted_status * stand_by_cost).sum().sum()
 
-#     n.model.add_constraints(
-#         lhs <= rhs * 1,
-#         name=f"GlobalConstraint-{region}_{periods.values[0]}_constant_cost",
-#     )
-#     #breakpoint()
-#     logger.info(
-#         f"Adding cost Limit for {region} in {periods.values[0]}",
-#     )
-#     logger.info(
-#         f"COST LIMIT VAR SUM IS {lhs.vars.sum()} and COEFFS SUM IS {lhs.coeffs.sum()}"
-#    )
+    # 4. Unit commitment costs
+    # keys = ["start_up", "shut_down"]
+    for c, attr in lookup.query("variable in @keys").index:
+        com_i = n.get_committable_i(c)
+        cost = n.df(c)[f"{attr}_cost"].reindex(com_i)
+        if cost.empty:
+            continue
+
+        # Get the commitment values
+        var = n.pnl(c)[attr]
+        if var.empty:
+            continue
+
+        total_cost += (var * cost).sum().sum()
+
+    return total_cost
 
 
 def add_constant_cost_constraints(n, sns, config, existing_data):
     """
-    Add a constant cost constraint to the network using create_model for efficiency.
+    Add a constant cost constraint to the network using the same cost components as the objective.
     """
     logger.info("Adding constant cost constraint.")
 
@@ -279,267 +292,236 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
     logger.info(f"Using {foresight} foresight")
     region = "national"
     periods = sns.unique("period")
-    current_period = periods.values[0]
 
     # Calculate reference cost limit
-    if existing_data:
-        logger.info("Using existing data inputs for constant cost constraint")
-        existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
-        region_cost_lim = existing_n.objective + existing_n.objective_constant
-        # breakpoint()#existing_n.statistics.capex() + existing_n.statistics.opex()
-        # region_cost_lim = region_cost_lim[2030].sum()
-    elif current_period == n.investment_periods[0]:
-        logger.info("First time horizon, no cost constraint needed")
-        return
-    else:
-        logger.info("No existing data to use for constant cost constraint, using first time step from myopic run")
-        region_cost_lim = n.statistics.capex() + n.statistics.opex()
-        # Make sure we're getting the right period's cost
-        region_cost_lim = region_cost_lim[current_period].sum()
+    logger.info("Using existing data inputs for constant cost constraint")
+    existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
 
-    # Always recreate the cost objective for the current period
-    logger.info(f"Creating cost objective expression for period {current_period}")
+    # Log detailed information about the reference network
+    logger.info("Reference network details:")
+    logger.info(f"Number of generators: {len(existing_n.generators)}")
+    logger.info(f"Number of links: {len(existing_n.links)}")
+    logger.info(f"Number of storage units: {len(existing_n.storage_units)}")
+    logger.info(f"Number of lines: {len(existing_n.lines)}")
 
-    # Create a temporary network to get a clean cost objective
-    temp_n = pypsa.Network(snakemake.input.network)
+    # Calculate and log cost components from reference network
+    ref_gen_costs = existing_n.generators.eval("capital_cost * p_nom").sum()
+    ref_link_costs = existing_n.links.eval("capital_cost * p_nom").sum()
+    ref_storage_costs = existing_n.storage_units.eval("capital_cost * p_nom").sum()
+    ref_line_costs = existing_n.lines.eval("capital_cost * s_nom").sum()
 
-    # Apply essential preparation to temp_n
-    temp_n = prepare_network(
-        temp_n,
-        config["solving"]["options"],
-        config=config,
-        foresight=foresight,
-        planning_horizons=config["scenario"]["planning_horizons"],
-    )
+    logger.info(f"Reference network generator costs: {ref_gen_costs}")
+    logger.info(f"Reference network link costs: {ref_link_costs}")
+    logger.info(f"Reference network storage costs: {ref_storage_costs}")
+    logger.info(f"Reference network line costs: {ref_line_costs}")
 
-    # Just create the model, don't optimize
-    temp_model = pypsa.optimization.create_model(temp_n, sns)
+    # Calculate current network costs for comparison
+    curr_gen_costs = n.generators.eval("capital_cost * p_nom").sum()
+    curr_link_costs = n.links.eval("capital_cost * p_nom").sum()
+    curr_storage_costs = n.storage_units.eval("capital_cost * p_nom").sum()
+    curr_line_costs = n.lines.eval("capital_cost * s_nom").sum()
 
-    # Extract the objective expression for this period
-    original_cost_objective = temp_model.objective.expression
+    logger.info("Current network costs:")
+    logger.info(f"Generator costs: {curr_gen_costs}")
+    logger.info(f"Link costs: {curr_link_costs}")
+    logger.info(f"Storage costs: {curr_storage_costs}")
+    logger.info(f"Line costs: {curr_line_costs}")
 
-    # Clean up to free memory
-    del temp_n
-    del temp_model
+    # Calculate cost ratios
+    gen_ratio = ref_gen_costs / curr_gen_costs if curr_gen_costs > 0 else float("inf")
+    link_ratio = ref_link_costs / curr_link_costs if curr_link_costs > 0 else float("inf")
+    storage_ratio = ref_storage_costs / curr_storage_costs if curr_storage_costs > 0 else float("inf")
+    line_ratio = ref_line_costs / curr_line_costs if curr_line_costs > 0 else float("inf")
 
-    # Define right-hand side and constraint parameters
-    rhs = 1.0
-    multiplier = 1.0001  # Small margin for numerical stability
+    logger.info("Cost ratios (reference/current):")
+    logger.info(f"Generator ratio: {gen_ratio}")
+    logger.info(f"Link ratio: {link_ratio}")
+    logger.info(f"Storage ratio: {storage_ratio}")
+    logger.info(f"Line ratio: {line_ratio}")
 
-    # Add the constraint with the original cost objective
-    n.model.add_constraints(
-        original_cost_objective / region_cost_lim <= rhs * multiplier,
-        name=f"GlobalConstraint-{region}_{current_period}_constant_cost",
-    )
-    logger.info(f"Original cost objective coeffs sum: {original_cost_objective.coeffs.sum()} ")
-    logger.info(f"Adding cost limit for {region} in {current_period} with multiplier {multiplier}")
-    logger.info(f"Cost limit value: {region_cost_lim}")
+    # Add cost constraint for each period
+    for period in periods:
+        period_sns = sns[sns.get_level_values("period") == period]
 
+        # Calculate period-specific cost limit without period weighting
+        region_cost_lim = calculate_total_cost(existing_n)  # existing_n.objective
 
-######## WORKING BUT WRONG ##########
-# def add_constant_cost_constraints(n, sns, config, existing_data):
-#     """
-#     Add a constant cost constraint to the network.
-#     """
-#     logger.info("Adding constant cost constraint.")
+        # Scale costs to improve numerical stability
+        scale_factor = 1e-9  # Scale to billions
+        region_cost_lim_scaled = region_cost_lim * scale_factor
 
-#     foresight = config["foresight"]
-#     logger.info(f"Using {foresight} foresight")
-#     region = "national"
-#     periods = sns.unique("period")
+        logger.info(f"Period {period} cost limit: {region_cost_lim}")
+        logger.info(f"Period {period} scaled cost limit: {region_cost_lim_scaled}")
 
-#     # Create a clean copy of the network for optimization
-#     temp_n = pypsa.Network(snakemake.input.network)
+        # Create cost components for this period
+        m = n.model
+        cost_components = []
+        is_quadratic = False
 
-#     # Apply only essential preparation to temp_n (no CO2 objective)
-#     temp_n = prepare_network(
-#         temp_n,
-#         config["solving"]["options"],
-#         config=config,
-#         foresight=foresight,
-#         planning_horizons=config["scenario"]["planning_horizons"],
-#     )
+        # Weightings
+        weighting = n.snapshot_weightings.objective
+        if n._multi_invest:
+            weighting = weighting.loc[period_sns]
+        else:
+            weighting = weighting.loc[period_sns]
 
-#     # Create solver options for temporary optimization
-#     solver_options = {}
-#     if "solver_options" in config["solving"]:
-#         solver_name = config["solving"]["solver"]["name"]
-#         options_set = config["solving"]["solver"]["options"]
-#         if options_set:
-#             solver_options = config["solving"]["solver_options"][options_set]
+        # Log the weighting information
+        logger.info(f"Period {period} snapshot weightings:")
+        logger.info(f"Number of snapshots: {len(weighting)}")
+        logger.info(f"Total weighting: {weighting.sum()}")
+        logger.info(f"Average weighting: {weighting.mean()}")
 
-#     temp_n.optimize(solver_name =solver_name, solver_options=solver_options, keep_files=False)
+        # marginal costs, marginal storage cost, and spill cost
+        for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
+            for c, attr in lookup.query(cost_type).index:
+                cost = (
+                    get_as_dense(n, c, cost_type, period_sns).loc[:, lambda ds: (ds != 0).any()].mul(weighting, axis=0)
+                )
+                if cost.empty:
+                    continue
+                operation = m[f"{c}-{attr}"].sel({"snapshot": period_sns, c: cost.columns})
+                component_cost = (operation * cost).sum() * scale_factor
+                cost_components.append(component_cost)
+                logger.info(f"Added {cost_type} cost component for {c}: {component_cost}")
 
-#     # Now we have a model with the correct cost objective structure
-#     cost_objective = temp_n.model.objective.expression
+        # investment costs
+        for c, attr in nominal_attrs.items():
+            ext_i = n.get_extendable_i(c)
+            if ext_i.empty:
+                continue
 
-#     # Calculate reference cost limit
-#     if existing_data == True:
-#         logger.info("Using existing data inputs for constant cost constraint")
-#         existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
-#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex()
-#         region_cost_lim = region_cost_lim[2030].sum()
-#     elif existing_data == False:
-#         if sns.unique("period") == n.investment_periods[0]:
-#             return
-#         logger.info(
-#             "No existing data to use for constant cost constraint, using first time step from myopic run"
-#         )
-#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex()
+            cost = n.df(c)["capital_cost"][ext_i]
+            if cost.empty:
+                continue
 
-#     # Define right-hand side
-#     rhs = 1.0
+            if n._multi_invest:
+                active = n.get_active_assets(c, period)[ext_i]
+                cost = cost[active]
 
-#     # Store the cost objective expression in our original network
-#     n._original_cost_objective = cost_objective
+            caps = m[f"{c}-{attr}"]
+            component_cost = (caps * cost).sum() * scale_factor
+            cost_components.append(component_cost)
+            logger.info(f"Added investment cost component for {c}: {component_cost}")
 
-#     # Create a simple multiplication of the cost objective
-#     # This avoids the complex mapping between different models
-#     multiplier = 1.0  # Start with higher value to ensure feasibility
+        # Create the total cost expression for this period
+        total_cost = sum(cost_components) if is_quadratic else merge(cost_components)
 
-#     # Add the constraint with the original cost objective
-#     n.model.add_constraints(
-#         n._original_cost_objective / region_cost_lim <= rhs * multiplier,
-#         name=f"GlobalConstraint-{region}_{periods.values[0]}_constant_cost"
-#     )
+        # Log the constraint details before adding
+        logger.info(f"Adding cost constraint for period {period}:")
+        logger.info(f"Total cost expression: {total_cost}")
+        logger.info(f"Cost limit: {region_cost_lim_scaled}")
+        logger.info(f"Constraint will be: {total_cost} <= {region_cost_lim_scaled}")
 
-#     logger.info(f"Adding cost Limit for {region} in {periods.values[0]} with multiplier {multiplier}")
-# def map_expression(expr, var_map):
-#     """
-#     Maps variables in an expression to their counterparts in another model.
+        # Add the constraint for this period
+        n.model.add_constraints(
+            total_cost <= region_cost_lim_scaled,
+            name=f"GlobalConstraint-{region}_{period}_constant_cost",
+        )
 
-#     Parameters:
-#     -----------
-#     expr : linopy expression
-#         The expression containing variables to be mapped
-#     var_map : dict
-#         Dictionary mapping variables from source model to target model
+        # Log the actual cost components for debugging
+        logger.info(f"Period {period} cost components:")
+        for i, component in enumerate(cost_components):
+            logger.info(f"Component {i}: {component}")
 
-#     Returns:
-#     --------
-#     mapped_expr : linopy expression
-#         The expression with variables mapped to the target model
-#     """
-#     # This is a simplified implementation - you may need to adjust based on
-#     # how linopy expressions are structured internally
+        # Log the sum of all cost components
+        total_components_cost = sum(component.sum() for component in cost_components)
+        logger.info(f"Total sum of cost components: {total_components_cost}")
 
-#     # Create a new expression with the same structure but mapped variables
-#     new_terms = []
+        # Log the constraint status
+        logger.info(f"Cost constraint added for period {period} with limit {region_cost_lim_scaled}")
 
-#     for term in expr.terms:
-#         if term.var in var_map:
-#             new_var = var_map[term.var]
-#             new_term = term.coeff * new_var
-#             new_terms.append(new_term)
-#         else:
-#             # For constants or unmapped variables, keep as is
-#             new_terms.append(term)
+    # Add a function to calculate and log final costs after optimization
+    def log_final_costs(n, period):
+        """Calculate and log the final costs after optimization."""
+        logger.info(f"\nFinal costs after optimization for period {period}:")
 
-#     # Sum the terms to create the new expression
-#     if new_terms:
-#         return sum(new_terms)
-#     else:
-#         return 0
+        # Calculate operational costs
+        gen_operational = n.generators_t.p.multiply(n.snapshot_weightings.objective, axis=0).sum().sum() * scale_factor
+        link_operational = n.links_t.p0.multiply(n.snapshot_weightings.objective, axis=0).sum().sum() * scale_factor
+        storage_operational = (
+            n.storage_units_t.p.multiply(n.snapshot_weightings.objective, axis=0).sum().sum() * scale_factor
+        )
 
-# def add_constant_cost_constraints(n, sns, config, existing_data):
-#     """
-#     Add a constant cost constraint to the network using manual cost definition.
-#     """
-#     logger.info("Adding constant cost constraint.")
+        # Calculate investment costs
+        gen_investment = n.generators.eval("capital_cost * p_nom").sum() * scale_factor
+        link_investment = n.links.eval("capital_cost * p_nom").sum() * scale_factor
+        storage_investment = n.storage_units.eval("capital_cost * p_nom").sum() * scale_factor
+        line_investment = n.lines.eval("capital_cost * s_nom").sum() * scale_factor
 
-#     foresight = config["foresight"]
-#     logger.info(f"Using {foresight} foresight")
-#     region = "national"
-#     periods = sns.unique("period")
+        logger.info(f"Operational costs:")
+        logger.info(f"  Generators: {gen_operational}")
+        logger.info(f"  Links: {link_operational}")
+        logger.info(f"  Storage: {storage_operational}")
 
-#     # Calculate reference cost limit
-#     if existing_data == True:
-#         logger.info("Using existing data inputs for constant cost constraint")
-#         existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
-#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex()
-#         region_cost_lim = region_cost_lim[2030].sum()
-#     elif existing_data == False:
-#         if sns.unique("period") == n.investment_periods[0]:
-#             return
-#         logger.info(
-#             "No existing data to use for constant cost constraint, using first time step from myopic run"
-#         )
-#         region_cost_lim = existing_n.statistics.capex() + existing_n.statistics.opex()
+        logger.info(f"Investment costs:")
+        logger.info(f"  Generators: {gen_investment}")
+        logger.info(f"  Links: {link_investment}")
+        logger.info(f"  Storage: {storage_investment}")
+        logger.info(f"  Lines: {line_investment}")
 
-#     # Define right-hand side
-#     rhs = 1.0
-#     multiplier = 1.02  # Higher value for feasibility
+        total_cost = (
+            gen_operational
+            + link_operational
+            + storage_operational
+            + gen_investment
+            + link_investment
+            + storage_investment
+            + line_investment
+        )
+        logger.info(f"Total cost: {total_cost}")
 
-#     # Manually create a cost expression
-#     total_cost = 0
+        # Compare with cost limit
+        cost_limit = existing_n.objective * scale_factor
+        logger.info(f"Cost limit: {cost_limit}")
+        logger.info(f"Cost limit violation: {total_cost - cost_limit}")
 
-#     # Generator capital costs
-#     ext_gens = n.generators.query('p_nom_extendable')
-#     if not ext_gens.empty:
-#         gen_cap_cost = n.model['Generator-p_nom'].loc[ext_gens.index] * ext_gens.capital_cost
-#         total_cost += gen_cap_cost.sum()
-
-#     # Generator operational costs
-#     for gen_name, gen in n.generators.iterrows():
-#         if gen_name in n.model['Generator-p'].coords['Generator'].values:
-#             p = n.model['Generator-p'].sel(Generator=gen_name)
-#             w = n.snapshot_weightings.objective
-#             total_cost += (p * w * gen.marginal_cost).sum()
-
-#     # Storage unit capital costs
-#     ext_storage = n.storage_units.query('p_nom_extendable')
-#     if not ext_storage.empty:
-#         sto_cap_cost = n.model['StorageUnit-p_nom'].loc[ext_storage.index] * ext_storage.capital_cost
-#         total_cost += sto_cap_cost.sum()
-
-#     # Link capital costs
-#     ext_links = n.links.query('p_nom_extendable')
-#     if not ext_links.empty:
-#         link_cap_cost = n.model['Link-p_nom'].loc[ext_links.index] * ext_links.capital_cost
-#         total_cost += link_cap_cost.sum()
-
-#     # Save this as the original cost objective
-#    # n._original_cost_objective = total_cost
-
-#     # Define LHS and apply constraint
-#     lhs = total_cost / region_cost_lim
-#     #breakpoint()
-#     n.model.add_constraints(
-#         lhs <= rhs * multiplier,
-#         name=f"GlobalConstraint-{region}_{periods.values[0]}_constant_cost",
-#     )
-
-#     logger.info(f"Adding cost Limit for {region} in {periods.values[0]} with multiplier {multiplier}")
+    # Add the logging function to be called after optimization
+    n.post_optimization_logging = log_final_costs
 
 
 def define_objective_co2(n, sns):
     """
-    Defines and writes out the objective function.
+    Defines and writes out the objective function for CO2 minimization.
+    This is used when 'co2obj' is in the options.
     """
-    ##### CO2 CASE ######
-
     weightings = n.snapshot_weightings.loc[n.snapshots]
+    planning_horizons = sns.unique("period")
 
-    emissions = n.carriers.co2_emissions.fillna(0)[lambda ds: ds != 0]
-    gens_em = n.generators.query("carrier in @emissions.index")
+    total_emissions = 0
+    for period in planning_horizons:
+        period_sns = sns[sns.get_level_values("period") == period]
+        period_weighting = weightings.loc[period_sns]
 
-    efficiency = get_as_dense(
-        n,
-        "Generator",
-        "efficiency",
-        inds=gens_em.index,
-    )  # mw_elect/mw_th
+        emissions = n.carriers.co2_emissions.fillna(0)[lambda ds: ds != 0]
+        gens_em = n.generators.query("carrier in @emissions.index")
 
-    planning_horizon = sns.unique("period")
+        efficiency = get_as_dense(
+            n,
+            "Generator",
+            "efficiency",
+            inds=gens_em.index,
+        )  # mw_elect/mw_th
 
-    em_pu = gens_em.carrier.map(emissions) / efficiency  # tonnes_co2/mw_electrical
-    em_pu = em_pu.multiply(weightings.generators, axis=0).loc[planning_horizon].fillna(0)
+        # Calculate emissions per unit for this period
+        em_pu = gens_em.carrier.map(emissions) / efficiency  # tonnes_co2/mw_electrical
+        em_pu = em_pu.multiply(period_weighting.generators, axis=0).fillna(0)
 
-    p_em = n.model["Generator-p"].loc[:, gens_em.index]  # .sel(period=planning_horizon)
+        # Get generator power variables for this period
+        p_em = n.model["Generator-p"].loc[period_sns, gens_em.index]
 
-    objective = (p_em * em_pu).sum()
+        # Add period emissions to total
+        period_emissions = (p_em * em_pu).sum()
+        total_emissions += period_emissions
 
-    logger.info("CO2 objective defined.")
+        logger.info(f"Period {period} emissions expression: {period_emissions}")
+
+    # Add a small penalty for emissions to encourage minimization
+    # while still allowing them to occur
+    penalty_factor = 1e-6  # Small penalty to encourage emission reduction
+    objective = total_emissions * penalty_factor
+
+    logger.info(f"CO2 objective defined with penalty factor {penalty_factor}.")
+    logger.info(f"Total emissions expression: {total_emissions}")
 
     return objective.sum()
 
