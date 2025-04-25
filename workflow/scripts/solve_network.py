@@ -199,28 +199,127 @@ lookup = pd.read_csv(
 )
 
 
-def calculate_total_cost(n):
+# def calculate_total_cost(n, ref_year):
+#     """Calculate total cost in the same way as the objective function"""
+#     total_cost = 0
+
+#     # Get snapshots for the year
+#     year_snapshots = n.snapshots[n.snapshots.get_level_values(0) == ref_year]
+
+#     # Get weightings for that year
+#     weightings = n.snapshot_weightings.objective.loc[year_snapshots]
+
+#     # 1. Capital costs (capex)
+#     for c, attr in nominal_attrs.items():
+#         ext_i = n.get_extendable_i(c)
+#         cost = n.df(c)["capital_cost"][ext_i]
+#         if cost.empty:
+#             continue
+
+#         # Get the optimal capacity values
+#         caps = n.df(c)[f"{attr}_opt"][ext_i]
+#         total_cost += (caps * cost).sum()
+
+#     # 2. Operational costs (opex)
+#     # Marginal costs, marginal storage cost, and spill cost
+#     for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
+#         for c, attr in lookup.query(cost_type).index:
+#             cost = n.df(c)[cost_type]
+#             if cost.empty:
+#                 continue
+
+#             # Get the operational values - handle different component types
+#             if c == "Generator":
+#                 operation = n.pnl(c)["p"]
+#             elif c == "StorageUnit":
+#                 operation = n.pnl(c)["p_dispatch"] - n.pnl(c)["p_store"]
+#             elif c == "Store":
+#                 operation = n.pnl(c)["p"]
+#             elif c == "Link":
+#                 operation = n.pnl(c)["p0"]
+#             else:
+#                 continue
+
+#             if operation.empty:
+#                 continue
+
+#             # Weight the operations
+#             weighted_operation = operation.mul(weightings, axis=0)
+#             total_cost += (weighted_operation * cost).sum().sum()
+
+#     # 3. Stand-by costs
+#     comps = {"Generator", "Link"}
+#     for c in comps:
+#         com_i = get_committable_i(n, c)
+#         if com_i.empty:
+#             continue
+
+#         stand_by_cost = n.df(c)["stand_by_cost"][com_i]
+#         if stand_by_cost.empty:
+#             continue
+
+#         # Get the status values
+#         status = n.pnl(c)["status"]
+#         if status.empty:
+#             continue
+
+#         # Weight the status
+#         weighted_status = status.mul(weightings, axis=0)
+#         total_cost += (weighted_status * stand_by_cost).sum().sum()
+
+#     # 4. Unit commitment costs
+#     keys = ["start_up", "shut_down"]
+#     for c, attr in lookup.query("variable in @keys").index:
+#         com_i = n.get_committable_i(c)
+#         cost = n.df(c)[f"{attr}_cost"].reindex(com_i)
+#         if cost.empty:
+#             continue
+
+#         # Get the commitment values
+#         var = n.pnl(c)[attr]
+#         if var.empty:
+#             continue
+
+#         total_cost += (var * cost).sum().sum()
+
+#     return total_cost
+
+
+def calculate_total_cost(n, ref_year):
     """Calculate total cost in the same way as the objective function"""
     total_cost = 0
 
-    # Get weightings
-    weightings = n.snapshot_weightings.objective
+    # Get snapshots for the year
+    year_snapshots = n.snapshots[n.snapshots.get_level_values(0) == ref_year]
 
-    # 1. Capital costs (capex)
+    # Get weightings for that year
+    weightings = n.snapshot_weightings.objective.loc[year_snapshots]
+
+    # 1. Capital costs (capex) - include all components, not just extendable
     for c, attr in nominal_attrs.items():
-        ext_i = n.get_extendable_i(c)
-        cost = n.df(c)["capital_cost"][ext_i]
-        if cost.empty:
+        # Get all components of this type that have a capital cost
+        capacity_costs = n.df(c)["capital_cost"]
+        if capacity_costs.empty:
             continue
 
-        # Get the optimal capacity values
-        caps = n.df(c)[f"{attr}_opt"][ext_i]
-        total_cost += (caps * cost).sum()
+        # Handle extendable and non-extendable components differently
+        ext_i = n.get_extendable_i(c)
+        non_ext_i = capacity_costs.index.difference(ext_i)
 
-    # 2. Operational costs (opex)
-    # Marginal costs, marginal storage cost, and spill cost
+        # For extendable components, use optimal capacity
+        if not ext_i.empty:
+            ext_caps = n.df(c)[f"{attr}_opt"][ext_i]
+            total_cost += (ext_caps * capacity_costs[ext_i]).sum()
+
+        # For non-extendable components, use p_nom
+        if not non_ext_i.empty:
+            non_ext_caps = n.df(c)[attr][non_ext_i]
+            total_cost += (non_ext_caps * capacity_costs[non_ext_i]).sum()
+
+    # 2. Operational costs (opex) - include all components with marginal costs
     for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
         for c, attr in lookup.query(cost_type).index:
+            # Get all components with this cost type
             cost = n.df(c)[cost_type]
             if cost.empty:
                 continue
@@ -240,11 +339,16 @@ def calculate_total_cost(n):
             if operation.empty:
                 continue
 
-            # Weight the operations
-            weighted_operation = operation.mul(weightings, axis=0)
-            total_cost += (weighted_operation * cost).sum().sum()
+            # Filter to columns in both operation and cost
+            common_cols = operation.columns.intersection(cost.index)
+            if common_cols.empty:
+                continue
 
-    # 3. Stand-by costs
+            # Weight the operations
+            weighted_operation = operation[common_cols].mul(weightings, axis=0)
+            total_cost += (weighted_operation * cost[common_cols]).sum().sum()
+
+    # 3. Stand-by costs for all components (not just extendable)
     comps = {"Generator", "Link"}
     for c in comps:
         com_i = get_committable_i(n, c)
@@ -260,11 +364,16 @@ def calculate_total_cost(n):
         if status.empty:
             continue
 
-        # Weight the status
-        weighted_status = status.mul(weightings, axis=0)
-        total_cost += (weighted_status * stand_by_cost).sum().sum()
+        # Filter to columns in both status and stand_by_cost
+        common_cols = status.columns.intersection(stand_by_cost.index)
+        if common_cols.empty:
+            continue
 
-    # 4. Unit commitment costs
+        # Weight the status
+        weighted_status = status[common_cols].mul(weightings, axis=0)
+        total_cost += (weighted_status * stand_by_cost[common_cols]).sum().sum()
+
+    # 4. Unit commitment costs for all components
     # keys = ["start_up", "shut_down"]
     for c, attr in lookup.query("variable in @keys").index:
         com_i = n.get_committable_i(c)
@@ -277,12 +386,17 @@ def calculate_total_cost(n):
         if var.empty:
             continue
 
-        total_cost += (var * cost).sum().sum()
+        # Filter to columns in both var and cost
+        common_cols = var.columns.intersection(cost.index)
+        if common_cols.empty:
+            continue
+
+        total_cost += (var[common_cols] * cost[common_cols]).sum().sum()
 
     return total_cost
 
 
-def add_constant_cost_constraints(n, sns, config, existing_data):
+def add_constant_cost_constraints(n, sns, config, ref_year):
     """
     Add a constant cost constraint to the network using the same cost components as the objective.
     """
@@ -344,7 +458,7 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
         period_sns = sns[sns.get_level_values("period") == period]
 
         # Calculate period-specific cost limit without period weighting
-        region_cost_lim = calculate_total_cost(existing_n)  # existing_n.objective
+        region_cost_lim = calculate_total_cost(existing_n, ref_year)  # existing_n.objective
 
         # Scale costs to improve numerical stability
         scale_factor = 1e-9  # Scale to billions
@@ -384,24 +498,51 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
                 cost_components.append(component_cost)
                 logger.info(f"Added {cost_type} cost component for {c}: {component_cost}")
 
-        # investment costs
+        # Investment costs - include both extendable and non-extendable components
         for c, attr in nominal_attrs.items():
-            ext_i = n.get_extendable_i(c)
-            if ext_i.empty:
+            # Get all components with capital costs
+            all_components = n.df(c)
+            cost_components_i = all_components[all_components.capital_cost > 0].index
+
+            if cost_components_i.empty:
                 continue
 
-            cost = n.df(c)["capital_cost"][ext_i]
-            if cost.empty:
-                continue
+            # Handle extendable components
+            ext_i = n.get_extendable_i(c).intersection(cost_components_i)
+            if not ext_i.empty:
+                ext_cost = n.df(c)["capital_cost"][ext_i]
 
-            if n._multi_invest:
-                active = n.get_active_assets(c, period)[ext_i]
-                cost = cost[active]
+                if n._multi_invest:
+                    active_ext = n.get_active_assets(c, period)[ext_i]
+                    ext_cost = ext_cost[active_ext]
 
-            caps = m[f"{c}-{attr}"]
-            component_cost = (caps * cost).sum() * scale_factor
-            cost_components.append(component_cost)
-            logger.info(f"Added investment cost component for {c}: {component_cost}")
+                # Use the correct dimension name for selection
+                ext_caps = m[f"{c}-{attr}"].sel({f"{c}-ext": ext_i})
+                ext_component_cost = (ext_caps * ext_cost).sum() * scale_factor
+                cost_components.append(ext_component_cost)
+                logger.info(f"Added investment cost component for extendable {c}: {ext_component_cost}")
+
+            # Handle non-extendable but active components
+            non_ext_i = cost_components_i.difference(ext_i)
+            if not non_ext_i.empty:
+                non_ext_cost = n.df(c)["capital_cost"].loc[non_ext_i]
+
+                if n._multi_invest:
+                    active_non_ext = n.get_active_assets(c, period)
+                    # Only keep components that are both in non_ext_i and active for this period
+                    active_non_ext_i = non_ext_i.intersection(active_non_ext)
+
+                    if active_non_ext_i.empty:
+                        continue
+
+                    non_ext_cost = non_ext_cost.loc[active_non_ext_i]
+                    non_ext_caps = n.df(c)[attr].loc[active_non_ext_i]
+                else:
+                    non_ext_caps = n.df(c)[attr].loc[non_ext_i]
+
+                non_ext_component_cost = (non_ext_caps * non_ext_cost).sum() * scale_factor
+                cost_components.append(non_ext_component_cost)
+                logger.info(f"Added investment cost component for non-extendable {c}: {non_ext_component_cost}")
 
         # Create the total cost expression for this period
         total_cost = sum(cost_components) if is_quadratic else merge(cost_components)
@@ -429,54 +570,6 @@ def add_constant_cost_constraints(n, sns, config, existing_data):
 
         # Log the constraint status
         logger.info(f"Cost constraint added for period {period} with limit {region_cost_lim_scaled}")
-
-    # Add a function to calculate and log final costs after optimization
-    def log_final_costs(n, period):
-        """Calculate and log the final costs after optimization."""
-        logger.info(f"\nFinal costs after optimization for period {period}:")
-
-        # Calculate operational costs
-        gen_operational = n.generators_t.p.multiply(n.snapshot_weightings.objective, axis=0).sum().sum() * scale_factor
-        link_operational = n.links_t.p0.multiply(n.snapshot_weightings.objective, axis=0).sum().sum() * scale_factor
-        storage_operational = (
-            n.storage_units_t.p.multiply(n.snapshot_weightings.objective, axis=0).sum().sum() * scale_factor
-        )
-
-        # Calculate investment costs
-        gen_investment = n.generators.eval("capital_cost * p_nom").sum() * scale_factor
-        link_investment = n.links.eval("capital_cost * p_nom").sum() * scale_factor
-        storage_investment = n.storage_units.eval("capital_cost * p_nom").sum() * scale_factor
-        line_investment = n.lines.eval("capital_cost * s_nom").sum() * scale_factor
-
-        logger.info(f"Operational costs:")
-        logger.info(f"  Generators: {gen_operational}")
-        logger.info(f"  Links: {link_operational}")
-        logger.info(f"  Storage: {storage_operational}")
-
-        logger.info(f"Investment costs:")
-        logger.info(f"  Generators: {gen_investment}")
-        logger.info(f"  Links: {link_investment}")
-        logger.info(f"  Storage: {storage_investment}")
-        logger.info(f"  Lines: {line_investment}")
-
-        total_cost = (
-            gen_operational
-            + link_operational
-            + storage_operational
-            + gen_investment
-            + link_investment
-            + storage_investment
-            + line_investment
-        )
-        logger.info(f"Total cost: {total_cost}")
-
-        # Compare with cost limit
-        cost_limit = existing_n.objective * scale_factor
-        logger.info(f"Cost limit: {cost_limit}")
-        logger.info(f"Cost limit violation: {total_cost - cost_limit}")
-
-    # Add the logging function to be called after optimization
-    n.post_optimization_logging = log_final_costs
 
 
 def define_objective_co2(n, sns):
@@ -1811,14 +1904,11 @@ def extra_functionality(n, snapshots):
             add_EQ_constraints(n, o)
     add_battery_constraints(n)
     add_land_use_constraints(n)
+    ref_year = config["scenario"]["ref_year"]
     if (
         "CC" in opts and n.generators.p_nom_extendable.any()
     ):  # and snapshots.unique('period') != n.investment_periods[0]:
-        add_constant_cost_constraints(n, snapshots, config, existing_data=True)
-    if (
-        "CCG" in opts and n.generators.p_nom_extendable.any()
-    ):  # and snapshots.unique('period') != n.investment_periods[0]:
-        add_constant_cost_constraints(n, snapshots, config, existing_data=False)
+        add_constant_cost_constraints(n, snapshots, config, ref_year)
 
     if "co2obj" in opts:
 
