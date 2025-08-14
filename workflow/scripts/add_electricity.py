@@ -926,6 +926,69 @@ def apply_pudl_fuel_costs(
     return n
 
 
+##LF ADDED
+# def add_load_shedding(n, voll_cost= 10)
+#     """
+#     Adds load shedding generators to each bus with a high marginal cost (VOLL).
+
+#     Parameters
+#     ----------
+#     n : pypsa.Network
+#         The PyPSA network
+#     voll_cost : float
+#         Value of lost load in $/MWh
+#     """
+#     logger.info(f"Adding load shedding generators with VOLL = {voll_cost} $/MWh")
+#         # Add missing carrier for load shedding
+#     add_missing_carriers(n, ["load_shedding"])
+
+#     # Create load shedding generators at each bus
+#     n.madd(
+#         class_name = "Generator",
+#         names = n.buses.index,
+#         suffix = "load_shedding",
+#         bus=n.buses.index,
+#         carrier="load_shedding",
+#         p_nom=1e6,  # Very high capacity to ensure it can always meet demand
+#         marginal_cost=voll_cost,  # $10/mwh based on https://www.sciencedirect.com/science/article/pii/S1040619022001130
+#         p_max_pu=1.0,
+#         p_min_pu=0.0,
+#     )
+
+## END LF ADD
+
+##LF ADDED
+# def add_load_shedding(n, voll_cost= 10)
+#     """
+#     Adds load shedding generators to each bus with a high marginal cost (VOLL).
+
+#     Parameters
+#     ----------
+#     n : pypsa.Network
+#         The PyPSA network
+#     voll_cost : float
+#         Value of lost load in $/MWh
+#     """
+#     logger.info(f"Adding load shedding generators with VOLL = {voll_cost} $/MWh")
+#         # Add missing carrier for load shedding
+#     add_missing_carriers(n, ["load_shedding"])
+
+#     # Create load shedding generators at each bus
+#     n.madd(
+#         class_name = "Generator",
+#         names = n.buses.index,
+#         suffix = "load_shedding",
+#         bus=n.buses.index,
+#         carrier="load_shedding",
+#         p_nom=1e6,  # Very high capacity to ensure it can always meet demand
+#         marginal_cost=voll_cost,  # $10/mwh based on https://www.sciencedirect.com/science/article/pii/S1040619022001130
+#         p_max_pu=1.0,
+#         p_min_pu=0.0,
+#     )
+
+## END LF ADD
+
+
 def main(snakemake):
     params = snakemake.params
     interconnection = snakemake.wildcards["interconnect"]
@@ -1098,6 +1161,7 @@ def main(snakemake):
         lambda x: ((x["p_nom"] - 0.001) if (x["p_nom_extendable"] and x["p_nom_min"] == 0) else x["p_nom_min"]),
         axis=1,
     )
+    # add_load_shedding(n, voll_cost=snakemake.config.get("electricity", {}).get("voll", 10))
 
     output_folder = os.path.dirname(snakemake.output[0]) + "/base_network"
     export_network_for_gis_mapping(n, output_folder)

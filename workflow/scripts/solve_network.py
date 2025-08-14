@@ -199,36 +199,49 @@ lookup = pd.read_csv(
 )
 
 
-# def calculate_total_cost(n, ref_year):
-#     """Calculate total cost in the same way as the objective function"""
+# def calculate_total_cost(n, ref_year, sns):
+#     """Calculate total cost for the system in a given time period"""
 #     total_cost = 0
 
 #     # Get snapshots for the year
+#     logger.info(f"Calculating total cost for year {ref_year}")
+#     #breakpoint()
 #     year_snapshots = n.snapshots[n.snapshots.get_level_values(0) == ref_year]
 
 #     # Get weightings for that year
+#     periods = sns.unique("period")
+#     period_weighting = n.investment_period_weightings.objective[periods]
 #     weightings = n.snapshot_weightings.objective.loc[year_snapshots]
+#     weightings = weightings.mul(period_weighting, level=0).loc[sns]
 
-#     # 1. Capital costs (capex)
+#     # 1. capex for all components, not just extendable
 #     for c, attr in nominal_attrs.items():
-#         ext_i = n.get_extendable_i(c)
-#         cost = n.df(c)["capital_cost"][ext_i]
-#         if cost.empty:
+#         # Get all components of this type that have a capital cost
+#         capacity_costs = n.df(c)["capital_cost"]
+#         if capacity_costs.empty:
 #             continue
 
-#         # Get the optimal capacity values
-#         caps = n.df(c)[f"{attr}_opt"][ext_i]
-#         total_cost += (caps * cost).sum()
+#         # For extendable components, use optimal capacity
+#         ext_i = n.get_extendable_i(c)
+#         if not ext_i.empty:
+#             ext_caps = n.df(c)[f"{attr}_opt"][ext_i]
+#             total_cost += (ext_caps * capacity_costs[ext_i]).sum()
 
-#     # 2. Operational costs (opex)
-#     # Marginal costs, marginal storage cost, and spill cost
+#         # For non-extendable components, use p_nom
+#         non_ext_i = capacity_costs.index.difference(ext_i)
+#         if not non_ext_i.empty:
+#             non_ext_caps = n.df(c)[attr][non_ext_i]
+#             total_cost += (non_ext_caps * capacity_costs[non_ext_i]).sum()
+
+#     # 2. opex for all components with marginal costs
 #     for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
 #         for c, attr in lookup.query(cost_type).index:
+#             # Get all components with this cost type
 #             cost = n.df(c)[cost_type]
 #             if cost.empty:
 #                 continue
 
-#             # Get the operational values - handle different component types
+#             # different component types
 #             if c == "Generator":
 #                 operation = n.pnl(c)["p"]
 #             elif c == "StorageUnit":
@@ -242,12 +255,17 @@ lookup = pd.read_csv(
 
 #             if operation.empty:
 #                 continue
+#             ### get_switchable_as_dense here to get the time varying costs
+#             # Filter to columns in both operation and cost
+#             common_cols = operation.columns.intersection(cost.index)
+#             if common_cols.empty:
+#                 continue
 
 #             # Weight the operations
-#             weighted_operation = operation.mul(weightings, axis=0)
-#             total_cost += (weighted_operation * cost).sum().sum()
+#             weighted_operation = operation[common_cols].mul(weightings, axis=0)
+#             total_cost += (weighted_operation * cost[common_cols]).sum().sum()
 
-#     # 3. Stand-by costs
+#     # 3. Stand-by costs for all components (not just extendable)
 #     comps = {"Generator", "Link"}
 #     for c in comps:
 #         com_i = get_committable_i(n, c)
@@ -263,11 +281,16 @@ lookup = pd.read_csv(
 #         if status.empty:
 #             continue
 
-#         # Weight the status
-#         weighted_status = status.mul(weightings, axis=0)
-#         total_cost += (weighted_status * stand_by_cost).sum().sum()
+#         # Filter to columns in both status and stand_by_cost
+#         common_cols = status.columns.intersection(stand_by_cost.index)
+#         if common_cols.empty:
+#             continue
 
-#     # 4. Unit commitment costs
+#         # Weight the status
+#         weighted_status = status[common_cols].mul(weightings, axis=0)
+#         total_cost += (weighted_status * stand_by_cost[common_cols]).sum().sum()
+
+#     # 4. Unit commitment costs for all components
 #     keys = ["start_up", "shut_down"]
 #     for c, attr in lookup.query("variable in @keys").index:
 #         com_i = n.get_committable_i(c)
@@ -280,296 +303,453 @@ lookup = pd.read_csv(
 #         if var.empty:
 #             continue
 
-#         total_cost += (var * cost).sum().sum()
+#         # Filter to columns in both var and cost
+#         common_cols = var.columns.intersection(cost.index)
+#         if common_cols.empty:
+#             continue
+
+#         total_cost += (var[common_cols] * cost[common_cols]).sum().sum()
 
 #     return total_cost
 
+# def add_cost_constraint_based_on_calculation(n, sns, config, ref_year):
+#     """
+#     Adds a constraint to limit total system costs based on how costs are calculated in calculate_total_cost.
 
-def calculate_total_cost(n, ref_year):
-    """Calculate total cost in the same way as the objective function"""
-    total_cost = 0
+#     This ensures the constraint is consistent with how costs are reported after optimization.
+#     """
+#     m = n.model
+#     cost_components = []
 
-    # Get snapshots for the year
-    year_snapshots = n.snapshots[n.snapshots.get_level_values(0) == ref_year]
+#     ######## RHS ########
+#     # Import the ref network from the config input
+#     ref_network = pypsa.Network(config["electricity"]["cost_constraints"])
 
-    # Get weightings for that year
-    weightings = n.snapshot_weightings.objective.loc[year_snapshots]
+#     # Calculate the cost limit for the reference network in the specified year (ref_year)
+#     cost_limit = calculate_total_cost(ref_network, ref_year, sns)
+#     logger.info(f"Reference network cost: {cost_limit:,.2f}")
 
-    # 1. Capital costs (capex) - include all components, not just extendable
-    for c, attr in nominal_attrs.items():
-        # Get all components of this type that have a capital cost
-        capacity_costs = n.df(c)["capital_cost"]
-        if capacity_costs.empty:
-            continue
+#     ######## LHS ########
+#     # Get snapshots for the year (sns)
+#     year_snapshots = n.snapshots[n.snapshots.get_level_values(0) == np.unique(sns.get_level_values(0))[0]]
 
-        # Handle extendable and non-extendable components differently
-        ext_i = n.get_extendable_i(c)
-        non_ext_i = capacity_costs.index.difference(ext_i)
+#     # Get weightings for that year (sns)
+#     weightings = n.snapshot_weightings.objective.loc[year_snapshots]
+#     ## INCLUDE PERIOD WEIGHTINGS
+#     scaling = 1e-9     # Scale costs to billions for numerical stability
+#     # 1. capex for extendable and non-extendable components
+#     for c, attr in nominal_attrs.items():
+#         # For extendable components
+#         ext_i = n.get_extendable_i(c)
+#         if not ext_i.empty:
+#             cost = n.df(c)["capital_cost"][ext_i]
+#             if not cost.empty:
+#                 caps = m[f"{c}-{attr}"]
+#                 component_cost = (caps * cost).sum() * scaling
+#                 cost_components.append(component_cost)
+#                 logger.info(f"Added extendable capital cost component for {c}")
 
-        # For extendable components, use optimal capacity
-        if not ext_i.empty:
-            ext_caps = n.df(c)[f"{attr}_opt"][ext_i]
-            total_cost += (ext_caps * capacity_costs[ext_i]).sum()
+#         # For non-extendable components, add as constant (not a variable)
+#         non_ext_i = n.df(c).index.difference(ext_i)
+#         if not non_ext_i.empty:
+#             cost = n.df(c)["capital_cost"][non_ext_i]
+#             if not cost.empty:
+#                 non_ext_caps = n.df(c)[attr][non_ext_i]
+#                 non_ext_cost = (non_ext_caps * cost).sum() * scaling
+#                 # Add as a constant
+#                 logger.info(f"Added non-extendable capital cost {non_ext_cost:.4g} for {c}")
+#                 if non_ext_cost > 0:
+#                     constant_var = m.add_variables(non_ext_cost, non_ext_cost, name=f"constant_{c}_capex")
+#                     cost_components.append(constant_var)
 
-        # For non-extendable components, use p_nom
-        if not non_ext_i.empty:
-            non_ext_caps = n.df(c)[attr][non_ext_i]
-            total_cost += (non_ext_caps * capacity_costs[non_ext_i]).sum()
+#     # 2. Opex  for all components with marginal costs
+#     for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
+#         for c, attr in lookup.query(cost_type).index:
+#             cost = (
+#                 get_as_dense(n, c, cost_type, year_snapshots)
+#                 .loc[:, lambda ds: (ds != 0).any()]
+#             )
+#             if cost.empty:
+#                 continue
 
-    # 2. Operational costs (opex) - include all components with marginal costs
-    for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
-        for c, attr in lookup.query(cost_type).index:
-            # Get all components with this cost type
-            cost = n.df(c)[cost_type]
-            if cost.empty:
-                continue
+#             # Apply weightings
+#             cost = cost.mul(weightings, axis=0)
 
-            # Get the operational values - handle different component types
-            if c == "Generator":
-                operation = n.pnl(c)["p"]
-            elif c == "StorageUnit":
-                operation = n.pnl(c)["p_dispatch"] - n.pnl(c)["p_store"]
-            elif c == "Store":
-                operation = n.pnl(c)["p"]
-            elif c == "Link":
-                operation = n.pnl(c)["p0"]
-            else:
-                continue
+#             # Get operation variables for those components
+#             operation = m[f"{c}-{attr}"].sel({"snapshot": year_snapshots, c: cost.columns})
+#             component_cost = (operation * cost).sum() * scaling
+#             cost_components.append(component_cost)
+#             logger.info(f"Added {cost_type} cost component for {c}")
 
-            if operation.empty:
-                continue
+#     # 3. Stand-by costs
+#     comps = {"Generator", "Link"}
+#     for c in comps:
+#         com_i = get_committable_i(n, c)
+#         if com_i.empty:
+#             continue
 
-            # Filter to columns in both operation and cost
-            common_cols = operation.columns.intersection(cost.index)
-            if common_cols.empty:
-                continue
+#         stand_by_cost = (
+#             get_as_dense(n, c, "stand_by_cost", year_snapshots, com_i)
+#             .loc[:, lambda ds: (ds != 0).any()]
 
-            # Weight the operations
-            weighted_operation = operation[common_cols].mul(weightings, axis=0)
-            total_cost += (weighted_operation * cost[common_cols]).sum().sum()
+#         )
+#         # Apply weightings
+#         stand_by_cost = stand_by_cost.mul(weightings, axis=0)
+#         if stand_by_cost.empty:
+#             continue
 
-    # 3. Stand-by costs for all components (not just extendable)
-    comps = {"Generator", "Link"}
-    for c in comps:
-        com_i = get_committable_i(n, c)
-        if com_i.empty:
-            continue
+#         stand_by_cost.columns.name = f"{c}-com"
+#         status = n.model.variables[f"{c}-status"].loc[:, stand_by_cost.columns]
+#         component_cost = (status * stand_by_cost).sum() * scaling
+#         cost_components.append(component_cost)
+#         logger.info(f"Added stand-by cost component for {c}")
 
-        stand_by_cost = n.df(c)["stand_by_cost"][com_i]
-        if stand_by_cost.empty:
-            continue
+#     # 4. Unit commitment costs
+#     keys = ["start_up", "shut_down"]
+#     for c, attr in lookup.query("variable in @keys").index:
+#         com_i = get_committable_i(n, c)
+#         cost = n.df(c)[f"{attr}_cost"].reindex(com_i)
+#         if cost.sum() == 0:
+#             continue
 
-        # Get the status values
-        status = n.pnl(c)["status"]
-        if status.empty:
-            continue
+#         var = m[f"{c}-{attr}"]
+#         component_cost = (var * cost).sum() * scaling
+#         cost_components.append(component_cost)
+#         logger.info(f"Added unit commitment cost component for {c}-{attr}")
 
-        # Filter to columns in both status and stand_by_cost
-        common_cols = status.columns.intersection(stand_by_cost.index)
-        if common_cols.empty:
-            continue
+#     # Create the total cost expression
+#     # Check if cost_components contains any LinOpy variables (not expressions)
+#     has_variables = any(hasattr(comp, "name") and not hasattr(comp, "coeffs") for comp in cost_components)
 
-        # Weight the status
-        weighted_status = status[common_cols].mul(weightings, axis=0)
-        total_cost += (weighted_status * stand_by_cost[common_cols]).sum().sum()
+#     # Handle the case where we have both variables and expressions
+#     if has_variables:
+#         # Convert variables to expressions where needed
+#         expressions = []
+#         for comp in cost_components:
+#             if hasattr(comp, "name") and not hasattr(comp, "coeffs"):
+#                 logger.info(f"Converting variable {comp.name} to expression")
+#                 # This is a variable, convert to an expression
+#                 expressions.append(comp * 1)  # Multiply by 1 creates an expression
+#             else:
+#                 # This is already an expression
+#                 expressions.append(comp)
 
-    # 4. Unit commitment costs for all components
-    # keys = ["start_up", "shut_down"]
-    for c, attr in lookup.query("variable in @keys").index:
-        com_i = n.get_committable_i(c)
-        cost = n.df(c)[f"{attr}_cost"].reindex(com_i)
-        if cost.empty:
-            continue
+#         total_cost = merge(expressions)
+#     else:
+#         # All components are expressions, use original code
+#         total_cost = merge(cost_components)
+#     #breakpoint()
+#     # Add the cost constraint
+#     cost_limit_scaled = cost_limit * scaling
+#     logger.info(f"Total cost expression components: {len(cost_components)}")
+#     logger.info(f"Scaled cost limit: {cost_limit_scaled}")
 
-        # Get the commitment values
-        var = n.pnl(c)[attr]
-        if var.empty:
-            continue
+#     m.add_constraints(
+#         total_cost <= cost_limit_scaled,
+#         name="total_cost_constraint"
+#     )
 
-        # Filter to columns in both var and cost
-        common_cols = var.columns.intersection(cost.index)
-        if common_cols.empty:
-            continue
+#     logger.info(f"Cost constraint added with limit {cost_limit_scaled}")
 
-        total_cost += (var[common_cols] * cost[common_cols]).sum().sum()
-
-    return total_cost
+#     return cost_limit
 
 
-def add_constant_cost_constraints(n, sns, config, ref_year):
+def save_unsolved_network(n, planning_horizon, intermed_networks_dir, **kwargs):
     """
-    Add a constant cost constraint to the network using the same cost components as the objective.
+    Save the network before optimization for a specific planning horizon.
+
+    Parameters:
+    -----------
+    n : pypsa.Network
+        The PyPSA network object
+    planning_horizon : str or int
+        The current planning horizon
+    output_dir : str
+        Directory to save the unsolved network to
     """
-    logger.info("Adding constant cost constraint.")
+    import os
 
-    foresight = config["foresight"]
-    logger.info(f"Using {foresight} foresight")
-    region = "national"
-    periods = sns.unique("period")
+    # Make sure the output directory exists
+    os.makedirs(intermed_networks_dir, exist_ok=True)
 
-    # Calculate reference cost limit
-    logger.info("Using existing data inputs for constant cost constraint")
-    existing_n = pypsa.Network(config["electricity"]["cost_constraints"])
+    # Create a deep copy of the network to avoid modifying the original
+    unsolved_n = n  # .copy()
 
-    # Log detailed information about the reference network
-    logger.info("Reference network details:")
-    logger.info(f"Number of generators: {len(existing_n.generators)}")
-    logger.info(f"Number of links: {len(existing_n.links)}")
-    logger.info(f"Number of storage units: {len(existing_n.storage_units)}")
-    logger.info(f"Number of lines: {len(existing_n.lines)}")
+    # Add metadata
+    unsolved_n.meta = {"planning_horizon": planning_horizon, "status": "unsolved"}
 
-    # Calculate and log cost components from reference network
-    ref_gen_costs = existing_n.generators.eval("capital_cost * p_nom").sum()
-    ref_link_costs = existing_n.links.eval("capital_cost * p_nom").sum()
-    ref_storage_costs = existing_n.storage_units.eval("capital_cost * p_nom").sum()
-    ref_line_costs = existing_n.lines.eval("capital_cost * s_nom").sum()
+    # Save to netcdf
+    output_file = os.path.join(intermed_networks_dir, f"unsolved_network_{planning_horizon}.nc")
+    logger.info(f"Saving unsolved network for planning horizon {planning_horizon} to {output_file}")
+    unsolved_n.export_to_netcdf(output_file)
 
-    logger.info(f"Reference network generator costs: {ref_gen_costs}")
-    logger.info(f"Reference network link costs: {ref_link_costs}")
-    logger.info(f"Reference network storage costs: {ref_storage_costs}")
-    logger.info(f"Reference network line costs: {ref_line_costs}")
+    return output_file
 
-    # Calculate current network costs for comparison
-    curr_gen_costs = n.generators.eval("capital_cost * p_nom").sum()
-    curr_link_costs = n.links.eval("capital_cost * p_nom").sum()
-    curr_storage_costs = n.storage_units.eval("capital_cost * p_nom").sum()
-    curr_line_costs = n.lines.eval("capital_cost * s_nom").sum()
 
-    logger.info("Current network costs:")
-    logger.info(f"Generator costs: {curr_gen_costs}")
-    logger.info(f"Link costs: {curr_link_costs}")
-    logger.info(f"Storage costs: {curr_storage_costs}")
-    logger.info(f"Line costs: {curr_line_costs}")
+def save_solved_network(n, planning_horizon, output_dir):
+    """
+    Save the network after optimization for a specific planning horizon.
 
-    # Calculate cost ratios
-    gen_ratio = ref_gen_costs / curr_gen_costs if curr_gen_costs > 0 else float("inf")
-    link_ratio = ref_link_costs / curr_link_costs if curr_link_costs > 0 else float("inf")
-    storage_ratio = ref_storage_costs / curr_storage_costs if curr_storage_costs > 0 else float("inf")
-    line_ratio = ref_line_costs / curr_line_costs if curr_line_costs > 0 else float("inf")
+    Parameters:
+    -----------
+    n : pypsa.Network
+        The PyPSA network object that has been solved
+    planning_horizon : str or int
+        The current planning horizon
+    output_dir : str
+        Directory to save the solved network to
+    """
+    import os
 
-    logger.info("Cost ratios (reference/current):")
-    logger.info(f"Generator ratio: {gen_ratio}")
-    logger.info(f"Link ratio: {link_ratio}")
-    logger.info(f"Storage ratio: {storage_ratio}")
-    logger.info(f"Line ratio: {line_ratio}")
+    # Make sure the output directory exists
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Add cost constraint for each period
-    for period in periods:
-        period_sns = sns[sns.get_level_values("period") == period]
+    # Create a deep copy of the network to avoid modifying the original
+    solved_n = n  # .copy()
 
-        # Calculate period-specific cost limit without period weighting
-        region_cost_lim = calculate_total_cost(existing_n, ref_year)  # existing_n.objective
+    # Add metadata about the objective value
+    solved_n.meta = {
+        "planning_horizon": planning_horizon,
+        "status": "solved",
+        "objective_value": float(n.objective) if hasattr(n, "objective") else None,
+        "objective_constant": float(n.objective_constant) if hasattr(n, "objective_constant") else 0,
+    }
 
-        # Scale costs to improve numerical stability
-        scale_factor = 1e-9  # Scale to billions
-        region_cost_lim_scaled = region_cost_lim * scale_factor
+    # Save to netcdf
+    output_file = os.path.join(output_dir, f"solved_network_{planning_horizon}.nc")
+    logger.info(f"Saving solved network for planning horizon {planning_horizon} to {output_file}")
+    logger.info(f"Objective value: {solved_n.meta['objective_value']}")
+    solved_n.export_to_netcdf(output_file)
 
-        logger.info(f"Period {period} cost limit: {region_cost_lim}")
-        logger.info(f"Period {period} scaled cost limit: {region_cost_lim_scaled}")
+    return output_file
 
-        # Create cost components for this period
-        m = n.model
-        cost_components = []
-        is_quadratic = False
 
-        # Weightings
-        weighting = n.snapshot_weightings.objective
-        if n._multi_invest:
-            weighting = weighting.loc[period_sns]
-        else:
-            weighting = weighting.loc[period_sns]
+def save_objective_expression(n, planning_horizon, output_dir, **kwargs):
+    """
+    Build a model for the network and save the objective expression without solving.
 
-        # Log the weighting information
-        logger.info(f"Period {period} snapshot weightings:")
-        logger.info(f"Number of snapshots: {len(weighting)}")
-        logger.info(f"Total weighting: {weighting.sum()}")
-        logger.info(f"Average weighting: {weighting.mean()}")
+    Parameters:
+    -----------
+    n : pypsa.Network
+        The PyPSA network object
+    planning_horizon : str or int
+        The current planning horizon
+    output_dir : str
+        Directory to save the objective to
 
-        # marginal costs, marginal storage cost, and spill cost
-        for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
-            for c, attr in lookup.query(cost_type).index:
-                cost = (
-                    get_as_dense(n, c, cost_type, period_sns).loc[:, lambda ds: (ds != 0).any()].mul(weighting, axis=0)
-                )
-                if cost.empty:
-                    continue
-                operation = m[f"{c}-{attr}"].sel({"snapshot": period_sns, c: cost.columns})
-                component_cost = (operation * cost).sum() * scale_factor
-                cost_components.append(component_cost)
-                logger.info(f"Added {cost_type} cost component for {c}: {component_cost}")
+    Returns:
+    --------
+    output_file : str
+        Path to the saved file
+    """
+    import os
+    import pickle
 
-        # Investment costs - include both extendable and non-extendable components
-        for c, attr in nominal_attrs.items():
-            # Get all components with capital costs
-            all_components = n.df(c)
-            cost_components_i = all_components[all_components.capital_cost > 0].index
+    from pypsa.optimization.optimize import create_model
 
-            if cost_components_i.empty:
-                continue
+    # Make sure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
 
-            # Handle extendable components
-            ext_i = n.get_extendable_i(c).intersection(cost_components_i)
-            if not ext_i.empty:
-                ext_cost = n.df(c)["capital_cost"][ext_i]
+    # Create a copy of the network to avoid modifying the original
+    n_copy = n
 
-                if n._multi_invest:
-                    active_ext = n.get_active_assets(c, period)[ext_i]
-                    ext_cost = ext_cost[active_ext]
+    # Get appropriate snapshots for this planning horizon
+    sns = n.snapshots[n.snapshots.get_level_values(0) == planning_horizon]
 
-                # Use the correct dimension name for selection
-                ext_caps = m[f"{c}-{attr}"].sel({f"{c}-ext": ext_i})
-                ext_component_cost = (ext_caps * ext_cost).sum() * scale_factor
-                cost_components.append(ext_component_cost)
-                logger.info(f"Added investment cost component for extendable {c}: {ext_component_cost}")
+    # Create the model without solving it
+    logger.info(f"Building model to extract objective expression for {planning_horizon}")
+    # Filter out kwargs that aren't needed for model creation
+    model_kwargs = {
+        k: v
+        for k, v in kwargs.items()
+        if k
+        in [
+            "transmission_losses",
+            "linearized_unit_commitment",
+            "multi_investment_periods",
+        ]
+    }
 
-            # Handle non-extendable but active components
-            non_ext_i = cost_components_i.difference(ext_i)
-            if not non_ext_i.empty:
-                non_ext_cost = n.df(c)["capital_cost"].loc[non_ext_i]
+    model = create_model(
+        n_copy,
+        snapshots=sns,
+        **model_kwargs,
+    )
+    from pathlib import Path  # Add this import
 
-                if n._multi_invest:
-                    active_non_ext = n.get_active_assets(c, period)
-                    # Only keep components that are both in non_ext_i and active for this period
-                    active_non_ext_i = non_ext_i.intersection(active_non_ext)
+    # Save the model to LP format instead of trying to save just the objective
+    output_file = os.path.join(output_dir, f"model_{planning_horizon}.mps")
+    # Convert the string path to a Path object
+    output_path = Path(output_file)
+    # breakpoint()
+    # # Extract coefficients and variable names
+    # objective_expr = model.objective
+    # coefficients = objective_expr.coeffs
+    # variables = objective_expr.vars
+    # index = pd.MultiIndex.from_tuples([tuple(var.name) for var in variables], names=['variable_i', 'variable_j'])
 
-                    if active_non_ext_i.empty:
-                        continue
+    # # Create a Pandas Series
+    # objective_series = pd.Series(data=coefficients, index=index)
 
-                    non_ext_cost = non_ext_cost.loc[active_non_ext_i]
-                    non_ext_caps = n.df(c)[attr].loc[active_non_ext_i]
-                else:
-                    non_ext_caps = n.df(c)[attr].loc[non_ext_i]
+    # print(objective_series)
+    model.to_file(output_path)
+    import json
 
-                non_ext_component_cost = (non_ext_caps * non_ext_cost).sum() * scale_factor
-                cost_components.append(non_ext_component_cost)
-                logger.info(f"Added investment cost component for non-extendable {c}: {non_ext_component_cost}")
-
-        # Create the total cost expression for this period
-        total_cost = sum(cost_components) if is_quadratic else merge(cost_components)
-
-        # Log the constraint details before adding
-        logger.info(f"Adding cost constraint for period {period}:")
-        logger.info(f"Total cost expression: {total_cost}")
-        logger.info(f"Cost limit: {region_cost_lim_scaled}")
-        logger.info(f"Constraint will be: {total_cost} <= {region_cost_lim_scaled}")
-
-        # Add the constraint for this period
-        n.model.add_constraints(
-            total_cost <= region_cost_lim_scaled,
-            name=f"GlobalConstraint-{region}_{period}_constant_cost",
+    # Save metadata separately
+    metadata_file = os.path.join(output_dir, f"metadata_{planning_horizon}.json")
+    with open(metadata_file, "w") as f:
+        json.dump(
+            {
+                "planning_horizon": planning_horizon,
+                "network_info": {
+                    "buses": len(n.buses),
+                    "generators": len(n.generators),
+                    "links": len(n.links),
+                    "storage_units": len(n.storage_units),
+                },
+            },
+            f,
         )
 
-        # Log the actual cost components for debugging
-        logger.info(f"Period {period} cost components:")
-        for i, component in enumerate(cost_components):
-            logger.info(f"Component {i}: {component}")
+    logger.info(f"Saved model with objective to {output_file}")
+    return output_file
 
-        # Log the sum of all cost components
-        total_components_cost = sum(component.sum() for component in cost_components)
-        logger.info(f"Total sum of cost components: {total_components_cost}")
 
-        # Log the constraint status
-        logger.info(f"Cost constraint added for period {period} with limit {region_cost_lim_scaled}")
+def parse_lp_file_objective(lp_file_path):
+    """Parse an LP file to extract the objective function as text."""
+    import re
+
+    with open(lp_file_path) as f:
+        lp_content = f.read()
+
+    # Extract objective section (between "Minimize" and "Subject To")
+    objective_pattern = re.compile(r"Minimize\s+(.*?)Subject To", re.DOTALL)
+    match = objective_pattern.search(lp_content)
+
+    if match:
+        objective_text = match.group(1).strip()
+        logger.info(f"Successfully extracted objective from LP file")
+        return objective_text
+    else:
+        logger.error("Could not extract objective from LP file")
+        return None
+        # m = parse_lp_file_objective(obj_expr_file)
+    # breakpoint()
+
+
+def convert_gurobi_obj_to_linopy(gurobi_obj, n_model):
+    """
+    Convert a Gurobi objective expression to a Linopy expression.
+
+    Parameters:
+    -----------
+    gurobi_obj : gurobipy.LinExpr
+        The Gurobi objective expression to convert
+    n_model : linopy.Model
+        The Linopy model where the expression will be used
+
+    Returns:
+    --------
+    linopy_expr : linopy.expressions.LinearExpression
+        Equivalent Linopy expression
+    """
+    import linopy
+
+    # Initialize empty lists to store terms
+    coefficients = []
+    variables = []
+
+    # Iterate through each term in the Gurobi objective
+    for i in range(gurobi_obj.size()):
+        var = gurobi_obj.getVar(i)
+        coeff = gurobi_obj.getCoeff(i)
+
+        # Extract variable name and find the corresponding Linopy variable
+        var_name = var.VarName
+
+        # Parse the variable name to determine the component and index
+        # This is the tricky part - you need to map Gurobi variable names to your Linopy variables
+        try:
+            # Example parsing: x[Generator-p,2030-01-01 00:00:00,gen1] -> ["Generator-p", "2030-01-01 00:00:00", "gen1"]
+            # The format may differ based on how Gurobi names variables
+            parts = var_name.replace("x[", "").replace("]", "").split(",")
+
+            # Determine the Linopy variable based on the component
+            var_type = parts[0].strip()
+
+            # Find the corresponding variable in the Linopy model
+            if var_type in n_model.variables:
+                # Create the proper indices for accessing the Linopy variable
+                # This will depend on how your variables are structured
+                linopy_var = n_model.variables[var_type]
+
+                # Add to our expression terms
+                coefficients.append(coeff)
+                variables.append(linopy_var)
+            else:
+                logger.warning(f"Could not find Linopy variable for Gurobi variable {var_name}")
+        except Exception as e:
+            logger.error(f"Error processing variable {var_name}: {e}")
+
+    # Create a Linopy expression from the collected terms
+    if len(coefficients) > 0:
+        return linopy.LinearExpression(
+            coefficients=coefficients,
+            variables=variables,
+        )
+    else:
+        return None
+
+
+def add_constant_cost_constraints(n, sns, config):
+    """
+    Add a constant cost constraint to the network.
+    This function adds a constraint to the network to ensure that the total
+    cost of the network in a given region is equal to a constant value.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        The PyPSA network object.
+    config : dict
+        A dictionary containing configuration settings and file paths.
+
+    Returns
+    -------
+    None
+    """
+    logger.info("Adding constant cost constraint.")
+    periods = sns.unique("period")
+
+    ## RHS is the original network cost from the first solved time period
+    logger.info("Using existing data inputs for constant cost constraint")
+    intermed_networks_dir = os.path.join(config["electricity"]["cost_constraints_path"], "unsolved_networks")
+    input_file = os.path.join(intermed_networks_dir, f"solved_network_2030.nc")
+    existing_n_obj = pypsa.Network(input_file)
+    rhs = existing_n_obj.objective + existing_n_obj.objective_constant
+
+    # LHS is the original objective expression from the saved file
+    obj_expr_dir = os.path.join(config["electricity"]["cost_constraints_path"], "objective_expressions")
+    obj_expr_file = os.path.join(obj_expr_dir, f"model_{periods.values[0]}.mps")
+    import gurobipy as gp
+
+    m_obj = gp.read(obj_expr_file)
+
+    # Get the objective expression
+    obj_expr = m_obj.getObjective()
+
+    # Convert to Linopy expression
+    linopy_expr = convert_gurobi_obj_to_linopy(obj_expr, n.model)
+
+    if linopy_expr is not None:
+        # Add the constraint
+        n.model.add_constraints(
+            linopy_expr <= rhs,
+            name=f"GlobalConstraint-constant_cost_{periods.values[0]}",
+        )
+        logger.info(f"Added constant cost constraint with RHS: {rhs}")
+    else:
+        logger.error("Failed to convert Gurobi objective to Linopy expression")
 
 
 def define_objective_co2(n, sns):
@@ -1904,11 +2084,12 @@ def extra_functionality(n, snapshots):
             add_EQ_constraints(n, o)
     add_battery_constraints(n)
     add_land_use_constraints(n)
-    ref_year = config["scenario"]["ref_year"]
+
     if (
         "CC" in opts and n.generators.p_nom_extendable.any()
     ):  # and snapshots.unique('period') != n.investment_periods[0]:
-        add_constant_cost_constraints(n, snapshots, config, ref_year)
+        # add_cost_constraint_based_on_calculation(n, snapshots, config, ref_year)
+        add_constant_cost_constraints(n, snapshots, config)
 
     if "co2obj" in opts:
 
@@ -1942,7 +2123,7 @@ def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
         raise RuntimeError("Solving status 'infeasible'")
 
 
-def solve_network(n, config, solving, opts="", **kwargs):
+def solve_network(n, config, solving, opts="", intermed_networks_dir=None, **kwargs):
     set_of_options = solving["solver"]["options"]
     cf_solving = solving["options"]
 
@@ -1976,15 +2157,66 @@ def solve_network(n, config, solving, opts="", **kwargs):
         case "perfect":
             run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs)
         case "myopic":
+            # total_cumulative_cost = 0
             for i, planning_horizon in enumerate(n.investment_periods):
+                logger.info(
+                    f"Starting optimization for planning horizon {planning_horizon} ({i+1}/{len(n.investment_periods)})",
+                )
+
                 # planning_horizons = snakemake.params.planning_horizons
                 sns_horizon = n.snapshots[n.snapshots.get_level_values(0) == planning_horizon]
 
+                if config["scenario"]["constant_cost_setup"]:
+                    # Save the unsolved network before optimization
+                    os.makedirs(intermed_networks_dir, exist_ok=True)
+                    unsolved_file = save_unsolved_network(n, planning_horizon, intermed_networks_dir, **kwargs)
+                    logger.info(f"Saved unsolved network to {unsolved_file}")
+
+                    # Save the objective expression
+                    obj_expr_dir = os.path.join(os.path.dirname(intermed_networks_dir), "objective_expressions")
+                    obj_expr_file = save_objective_expression(n, planning_horizon, obj_expr_dir, **kwargs)
+                    logger.info(f"Saved objective expression to {obj_expr_file}")
+
                 # add sns_horizon to kwarg
+                # kwargs["snapshots"] = sns_horizon
+
+                # run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs)
+                # period_cost = calculate_total_cost(n, sns_horizon)
+                # logger.info(f"System cost for planning horizon {planning_horizon}: ${period_cost:,.2f}")
+
+                #################### LOGGING FOR DEBUGGING ######################
+                # Calculate and log the system cost for this planning horizon
+
+                # Calculate estimated cost for components before optimization
+                if hasattr(n, "df"):
+                    capex_est = sum(
+                        (n.df(c)["capital_cost"] * n.df(c)["p_nom"]).sum()
+                        for c in ["Generator", "Link", "StorageUnit"]
+                        if hasattr(n, c)
+                    )
+                    logger.info(f"Estimated capital cost before optimization for {planning_horizon}: ${capex_est:,.2f}")
+
+                # Add sns_horizon to kwarg
                 kwargs["snapshots"] = sns_horizon
 
                 run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs)
+                # ref_year = config["scenario"]["ref_year"]
+                # Calculate and log the system cost for this planning horizon
+                # period_cost = calculate_total_cost(n, ref_year)
+                # logger.info(f"System cost for planning horizon {planning_horizon}: ${period_cost:,.2f}")
+                # Save the solved network after optimization (especially important for the first period)
+                if config["scenario"]["constant_cost_setup"] and i == 0:
+                    os.makedirs(intermed_networks_dir, exist_ok=True)
+                    solved_file = save_solved_network(n, planning_horizon, intermed_networks_dir)
+                    logger.info(f"Saved solved network for planning horizon {planning_horizon} to {solved_file}")
 
+                # Update cumulative cost
+                # total_cumulative_cost += period_cost
+                # logger.info(f"Cumulative system cost up to {planning_horizon}: ${total_cumulative_cost:,.2f}")
+
+                #################### LOGGING FOR DEBUGGING ######################
+
+                # Brownfield preparation
                 if i == len(n.investment_periods) - 1:
                     logger.info(f"Final time horizon {planning_horizon}")
                     continue
@@ -2100,6 +2332,8 @@ if __name__ == "__main__":
 
     n = pypsa.Network(snakemake.input.network)
 
+    intermed_networks_dir = os.path.join(os.path.dirname(snakemake.output[0]), "unsolved_networks")
+
     n = prepare_network(
         n,
         solve_opts,
@@ -2114,6 +2348,7 @@ if __name__ == "__main__":
         solving=snakemake.params.solving,
         opts=opts,
         log_fn=snakemake.log.solver,
+        intermed_networks_dir=intermed_networks_dir,
     )
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
     n.export_to_netcdf(snakemake.output[0])

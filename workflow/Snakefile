@@ -43,6 +43,7 @@ FIGURES_SYSTEM = [
     "generator_data_panel.pdf",
     "fuel_costs.pdf",
     "region_lmps.pdf",
+    "incremental_capacity_additions.pdf",
 ]
 
 FIGURES_VALIDATE = [

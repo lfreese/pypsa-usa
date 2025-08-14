@@ -894,6 +894,73 @@ def plot_fuel_costs(
     plt.close()
 
 
+def plot_incremental_capacity_additions(n: pypsa.Network, save: str) -> None:
+    """
+    Plot incremental capacity additions between planning periods.
+    Shows only the new capacity added in each period, not cumulative.
+    """
+    data = get_statistics(n, "Optimal Capacity")
+    data = data / 1e3  # Convert to GW
+
+    # Calculate incremental additions by taking the difference between periods
+    incremental_data = data.diff(axis=1)
+    incremental_data = incremental_data.drop(
+        columns=incremental_data.columns[0],
+    )  # Drop first period as it has no difference
+
+    # Get existing capacity for reference
+    existing_cap = get_currently_installed_capacity(n)
+    existing_cap = existing_cap / 1e3  # Convert to GW
+
+    # Set up the figure and axes
+    regions = incremental_data.index.get_level_values(0).unique()
+    num_regions = len(regions)
+    columns = min(5, num_regions)  # Limit to 5 columns
+    rows = math.ceil(num_regions / columns)
+
+    # Increase figure height to accommodate legend
+    fig, axes = plt.subplots(rows, columns, figsize=(columns * 2.5, rows * 5 + 1), sharex=True, sharey=True)
+    axes = axes.flatten()
+
+    palette = n.carriers.set_index("nice_name").color.to_dict()
+
+    for i, region in enumerate(regions):
+        region_data = incremental_data.loc[region]
+        region_data.T.plot(
+            kind="bar",
+            stacked=True,
+            ax=axes[i],
+            color=[palette.get(carrier) for carrier in region_data.index.get_level_values(0)],
+            legend=False,
+        )
+        axes[i].axhline(0, color="black", linewidth=0.8)
+        axes[i].set_title(region)
+        axes[i].set_ylabel("Incremental Capacity Additions (GW)")
+        axes[i].set_xlabel("")
+
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    # Create legend
+    handles, labels = [], []
+    for carrier in incremental_data.reset_index().Carrier.unique():
+        handle = plt.Rectangle((0, 0), 1, 1, color=palette[carrier])
+        handles.append(handle)
+        labels.append(f"{carrier}")
+    fig.legend(handles, labels, title="Carrier", loc="lower center", bbox_to_anchor=(0.5, -0.1), ncol=columns)
+
+    # Adjust layout with more space at bottom and top
+    plt.tight_layout(rect=[0, 0.1, 1, 0.95])  # Increased bottom margin to 0.1, reduced top margin to 0.95
+    plt.subplots_adjust(wspace=0.4, hspace=0.4)  # Added hspace for better vertical spacing
+    fig.suptitle("Incremental Capacity Additions by Planning Period", y=0.98)  # Moved title up slightly
+
+    # Save the data to CSV
+    incremental_data.to_csv(f"{Path(save).parent.parent}/statistics/incremental_capacity_additions.csv")
+
+    fig.savefig(save, bbox_inches="tight")  # Added bbox_inches='tight' to ensure all elements are included
+    plt.close()
+
+
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
@@ -978,6 +1045,11 @@ if __name__ == "__main__":
     plot_emissions_bar(
         n,
         snakemake.output["bar_emissions.pdf"],
+    )
+    # Add the new incremental capacity additions plot
+    plot_incremental_capacity_additions(
+        n,
+        snakemake.output["incremental_capacity_additions.pdf"],
     )
 
     # Time Series Plots
