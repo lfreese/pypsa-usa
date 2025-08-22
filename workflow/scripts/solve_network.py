@@ -540,22 +540,55 @@ def add_constant_cost_constraints(n, sns, config, ref_year):
             logger.info(f"DEBUG: Raw ref_opex index: {ref_opex.index if hasattr(ref_opex, 'index') else 'No index'}")
 
             if isinstance(ref_capex.index, pd.MultiIndex) and "period" in ref_capex.index.names:
+                # For multi-period: get costs only for the first time period
                 period_ref_capex = (
-                    ref_capex.loc[period].sum() if period in ref_capex.index.get_level_values("period") else 0
+                    ref_capex.loc[2030].sum().sum()  # use the first time period to set costs for all future ones
                 )
                 period_ref_opex = (
-                    ref_opex.loc[period].sum() if period in ref_opex.index.get_level_values("period") else 0
+                    ref_opex.loc[2030].sum().sum()  # use the first time period to set costs for all future ones
                 )
+                logger.info(f"DEBUG: Multi-period reference - using only period {period} costs")
             else:
+                # For single-period: use all costs
                 period_ref_capex = ref_capex.sum().sum() if hasattr(ref_capex, "sum") else 0
                 period_ref_opex = ref_opex.sum().sum() if hasattr(ref_opex, "sum") else 0
+                logger.info("DEBUG: Single-period reference - using all costs")
 
             # DEBUG: Log the individual components
             logger.info(f"DEBUG: period_ref_capex = ${period_ref_capex / 1e9:.2f}B")
             logger.info(f"DEBUG: period_ref_opex = ${period_ref_opex / 1e9:.2f}B")
 
-            cost_limit = period_ref_capex + period_ref_opex
-            logger.info(f"Period {period} reference cost limit: ${cost_limit / 1e9:.2f}B")
+            # Apply period weighting to reference costs for consistency
+            if (
+                hasattr(existing_n, "investment_period_weightings")
+                and not existing_n.investment_period_weightings.empty
+            ):
+                ref_period_weight = existing_n.investment_period_weightings.get(period, 1.0)
+            else:
+                ref_period_weight = 1.0
+
+            # Apply the same period weighting logic as used in constraints
+            weighted_ref_capex = period_ref_capex * ref_period_weight
+            weighted_ref_opex = period_ref_opex * ref_period_weight
+            base_cost_limit = weighted_ref_capex + weighted_ref_opex
+
+            # Apply CO₂ optimization budget multiplier if needed
+            opts_list = config.get("scenario", {}).get("opts", [])
+            has_co2obj = any("co2obj" in opt for opt in opts_list)
+            if has_co2obj:
+                co2_budget_multiplier = 10.0  # Allow 10x budget for CO₂ optimization (was 3x)
+                cost_limit = base_cost_limit * co2_budget_multiplier
+                logger.info(f"🎯 CO₂ optimization detected - applying {co2_budget_multiplier}x budget multiplier")
+                logger.info(f"   Base budget: ${base_cost_limit / 1e9:.2f}B")
+                logger.info(f"   CO₂ budget: ${cost_limit / 1e9:.2f}B")
+            else:
+                cost_limit = base_cost_limit
+                logger.info(f"Standard cost optimization budget: ${cost_limit / 1e9:.2f}B")
+
+            logger.info(f"DEBUG: Applied period weight {ref_period_weight} to reference costs")
+            logger.info(f"DEBUG: weighted_ref_capex = ${weighted_ref_capex / 1e9:.2f}B")
+            logger.info(f"DEBUG: weighted_ref_opex = ${weighted_ref_opex / 1e9:.2f}B")
+            logger.info(f"Period {period} reference cost limit (period-weighted): ${cost_limit / 1e9:.2f}B")
 
         except Exception as e:
             logger.warning(f"Could not calculate reference costs: {e}")
@@ -568,59 +601,328 @@ def add_constant_cost_constraints(n, sns, config, ref_year):
         # Get period-specific snapshots
         period_snapshots = sns[sns.get_level_values(0) == period]
 
-        # SIMPLIFIED: Only constrain GENERATORS (both CAPEX and OPEX)
-        logger.info("🎯 SIMPLIFIED CONSTRAINT: Only constraining generator costs")
+        # IMPROVED: Generator + Storage constraints with proper period weighting and active asset checking
+        logger.info("🎯 IMPROVED CONSTRAINT: Generator + Storage costs with period weighting and active assets")
 
-        # 1. Generator CAPEX: Use vectorized .dot() approach - much faster than loops
+        # Get period weighting for this period (for discounting)
+        if hasattr(n, "investment_period_weightings") and not n.investment_period_weightings.empty:
+            period_weight = n.investment_period_weightings.get(period, 1.0)
+        else:
+            period_weight = 1.0  # Default if no period weightings
+
+        logger.info(f"Period {period} weight: {period_weight}")
+
+        # 1. Generator CAPEX: Include period weighting and active asset checking
         gen_capex = 0
         ext_gens = n.generators.query("p_nom_extendable")
+
         if not ext_gens.empty:
-            # Vectorized approach using .dot() - multiply p_nom variables by capital costs
-            gen_capex = n.model.variables["Generator-p_nom"].dot(ext_gens.capital_cost)
-            logger.info(f"  Added generator CAPEX for {len(ext_gens)} generators (vectorized)")
+            # Check for active assets in this period
+            if hasattr(n.generators, "active") and hasattr(n.generators.active, "loc"):
+                try:
+                    # Get active generators for this period
+                    active_mask = n.generators.active.loc[period_snapshots, ext_gens.index].any(axis=0)
+                    active_ext_gens = ext_gens[active_mask]
+                    logger.info(
+                        f"  Found {len(active_ext_gens)} active extendable generators out of {len(ext_gens)} total",
+                    )
+                except (KeyError, AttributeError):
+                    # Fallback: assume all extendable generators are active
+                    active_ext_gens = ext_gens
+                    logger.info(
+                        f"  No active asset data found, assuming all {len(ext_gens)} extendable generators are active",
+                    )
+            else:
+                # Fallback: assume all extendable generators are active
+                active_ext_gens = ext_gens
+                logger.info(
+                    f"  No active asset tracking, assuming all {len(ext_gens)} extendable generators are active",
+                )
+
+            if not active_ext_gens.empty:
+                # Apply period weighting to capital costs
+                weighted_capital_costs = active_ext_gens.capital_cost * period_weight
+                # Filter p_nom variables to only the active extendable generators
+                gen_p_nom_vars = n.model.variables["Generator-p_nom"].loc[active_ext_gens.index]
+                # Use element-wise multiplication and sum (not dot product which creates outer product)
+                gen_capex = (gen_p_nom_vars * weighted_capital_costs).sum()
+                logger.info(
+                    f"  Added generator CAPEX for {len(active_ext_gens)} active generators with period weight {period_weight}",
+                )
+            else:
+                logger.info("  No active extendable generators found")
         else:
             logger.info("  No extendable generators found")
 
-        # 2. Generator OPEX: Use memory-efficient approach
+        # 2. Generator OPEX: Include proper snapshot weighting for this period
         gen_opex = 0
         if not n.generators.empty:
-            logger.info("Using memory-efficient OPEX calculation...")
+            logger.info("Adding generator OPEX with proper snapshot weighting...")
 
-            # Skip the complex vectorized operations entirely
-            # Just use a simple sum of marginal costs weighted by annual generation
-
-            # Get marginal costs per generator
+            # Get marginal costs per generator ($/MW/h)
             mc = n.generators.marginal_cost
 
-            # Get total annual weightings for this period
-            total_weight = n.snapshot_weightings.objective.loc[period_snapshots].sum()
+            # Get snapshot weightings for this specific period (hours)
+            period_snapshot_weights = n.snapshot_weightings.objective.loc[period_snapshots]
 
-            # Simple approach: pre-compute total weighted marginal cost factor
-            # This avoids creating large linopy expressions
-            total_mc_weight = (mc * total_weight).sum()
+            # Get generator power variables for this period (MW)
+            gen_p = n.model["Generator-p"].loc[period_snapshots, :]
 
-            # For constraint purposes, we'll use a simplified representation
-            # that captures the essential cost relationship without the full complexity
-            logger.info(f"Total marginal cost weight factor: {total_mc_weight}")
+            # Filter to common generators
+            common_gens = mc.index.intersection(gen_p.coords["Generator"].values)
+            if not common_gens.empty:
+                # CORRECT UNITS: Use vectorized operations like PyPSA does
+                # This matches PyPSA's objective function calculation
+                weighted_mc = mc[common_gens] * period_weight  # Apply period weighting to marginal costs
 
-            # Since this is for a constraint (not the actual objective),
-            # we can use a representative approximation
-            gen_opex = total_mc_weight  # Simplified constant for constraint
+                # Work with linopy variables directly to avoid coordinate conflicts
+                # gen_p_subset has dimensions [snapshot, Generator] where snapshot = (period, timestep)
+                # period_snapshot_weights has index [snapshot] matching gen_p_subset's snapshot dimension
+                # weighted_mc has dimension [Generator] matching gen_p_subset's Generator dimension
 
-            logger.info(f"  Added simplified generator OPEX for period {period}")
-            logger.info("DEBUG: Generator OPEX calculation completed")
+                # Select only the common generators from gen_p
+                gen_p_subset = gen_p.sel(Generator=common_gens)
+
+                # Create a proper weighting array that matches gen_p_subset dimensions
+                # Convert snapshot weights to xarray DataArray with matching coordinates
+                snapshot_weights_da = xr.DataArray(
+                    period_snapshot_weights.values,
+                    coords=[period_snapshots],
+                    dims=["snapshot"],
+                )
+
+                # Multiply power by snapshot weights: (MW) * (h) -> MWh
+                # This creates the weighted generation expression using xarray broadcasting
+                weighted_gen_p = gen_p_subset * snapshot_weights_da
+
+                # Apply marginal costs: (MWh) * ($/MW/h) -> $
+                # Convert weighted_mc to xarray DataArray with proper coordinates
+                weighted_mc_da = xr.DataArray(
+                    weighted_mc.values,
+                    coords=[common_gens],
+                    dims=["Generator"],
+                )
+
+                gen_opex = (weighted_gen_p * weighted_mc_da).sum()
+
+                logger.info(
+                    f"  Added generator OPEX for {len(common_gens)} generators with proper units: MW * h * ($/MW/h)",
+                )
+                logger.info(f"  Total snapshot weights: {period_snapshot_weights.sum():.0f} hours")
+            else:
+                logger.info("  No common generators found between marginal costs and power variables")
         else:
             logger.info("  No generators found for OPEX calculation")
 
-        # Set a test cost limit
-        cost_limit = 2e10  # attempt our own cost limit for testing
+        logger.info(f"Total generator CAPEX (period-weighted): {gen_capex}")
+        logger.info(f"Total generator OPEX (period-weighted): {gen_opex}")
+        logger.info("Generator cost calculation completed with proper weighting")
 
-        # Now test the FULL constraint (CAPEX + OPEX) using the corrected approach
-        logger.info("🎯 TESTING FULL CONSTRAINT: Generator CAPEX + OPEX (following simple example)")
+        # 3. Storage CAPEX: Include period weighting and active asset checking
+        storage_capex = 0
+        ext_storage = n.storage_units.query("p_nom_extendable") if not n.storage_units.empty else pd.DataFrame()
 
-        # 3. Total generator cost constraint using GlobalConstraint approach
-        total_generator_cost = gen_capex + gen_opex  # Full constraint
-        constraint_name = f"generator_full_cost_constraint_{period}"
+        if not ext_storage.empty:
+            # Check for active storage assets in this period
+            if hasattr(n.storage_units, "active") and hasattr(n.storage_units.active, "loc"):
+                try:
+                    # Get active storage units for this period
+                    active_mask = n.storage_units.active.loc[period_snapshots, ext_storage.index].any(axis=0)
+                    active_ext_storage = ext_storage[active_mask]
+                    logger.info(
+                        f"  Found {len(active_ext_storage)} active extendable storage units out of {len(ext_storage)} total",
+                    )
+                except (KeyError, AttributeError):
+                    # Fallback: assume all extendable storage units are active
+                    active_ext_storage = ext_storage
+                    logger.info(
+                        f"  No active storage asset data found, assuming all {len(ext_storage)} extendable storage units are active",
+                    )
+            else:
+                # Fallback: assume all extendable storage units are active
+                active_ext_storage = ext_storage
+                logger.info(
+                    f"  No active storage asset tracking, assuming all {len(ext_storage)} extendable storage units are active",
+                )
+
+            if not active_ext_storage.empty:
+                # Apply period weighting to storage capital costs
+                weighted_storage_capital_costs = active_ext_storage.capital_cost * period_weight
+                # Filter p_nom variables to only the active extendable storage units
+                storage_p_nom_vars = n.model.variables["StorageUnit-p_nom"].loc[active_ext_storage.index]
+                # Use element-wise multiplication and sum (not dot product which creates outer product)
+                storage_capex = (storage_p_nom_vars * weighted_storage_capital_costs).sum()
+                logger.info(
+                    f"  Added storage CAPEX for {len(active_ext_storage)} active storage units with period weight {period_weight}",
+                )
+            else:
+                logger.info("  No active extendable storage units found")
+        else:
+            logger.info("  No extendable storage units found")
+
+        # 4. Storage OPEX: Include marginal costs for storage
+        storage_opex = 0
+        if not n.storage_units.empty:
+            logger.info("Adding storage OPEX with proper snapshot weighting...")
+
+            # Get marginal costs per storage unit ($/MW/h)
+            storage_mc = n.storage_units.get("marginal_cost", pd.Series(dtype=float))
+            storage_mc_storage = n.storage_units.get("marginal_cost_storage", pd.Series(dtype=float))
+
+            if not storage_mc.empty or not storage_mc_storage.empty:
+                # Get snapshot weightings for this specific period (hours)
+                period_snapshot_weights = n.snapshot_weightings.objective.loc[period_snapshots]
+
+                storage_opex = 0
+
+                # Handle marginal_cost for storage dispatch ($/MW/h)
+                if not storage_mc.empty:
+                    # Get storage power variables for this period (MW)
+                    # For storage, we need both dispatch and store power
+                    if "StorageUnit-p_dispatch" in n.model.variables:
+                        storage_p_dispatch = n.model["StorageUnit-p_dispatch"].loc[period_snapshots, :]
+                        common_storage = storage_mc.index.intersection(storage_p_dispatch.coords["StorageUnit"].values)
+
+                        if not common_storage.empty:
+                            weighted_storage_mc = storage_mc[common_storage] * period_weight
+
+                            # Work with linopy variables directly for storage dispatch
+                            storage_p_subset = storage_p_dispatch.sel(StorageUnit=common_storage)
+
+                            # Use xarray broadcasting for snapshot weights
+                            snapshot_weights_da = xr.DataArray(
+                                period_snapshot_weights.values,
+                                coords=[period_snapshots],
+                                dims=["snapshot"],
+                            )
+
+                            # Vectorized calculation: (MW) * (h) * ($/MW/h) = $
+                            weighted_dispatch = storage_p_subset * snapshot_weights_da
+
+                            # Convert marginal costs to xarray DataArray with proper coordinates
+                            weighted_storage_mc_da = xr.DataArray(
+                                weighted_storage_mc.values,
+                                coords=[common_storage],
+                                dims=["StorageUnit"],
+                            )
+
+                            storage_opex += (weighted_dispatch * weighted_storage_mc_da).sum()
+
+                # Handle marginal_cost_storage for storage charge operations ($/MW/h)
+                if not storage_mc_storage.empty:
+                    if "StorageUnit-p_store" in n.model.variables:
+                        storage_p_store = n.model["StorageUnit-p_store"].loc[period_snapshots, :]
+                        common_storage_store = storage_mc_storage.index.intersection(
+                            storage_p_store.coords["StorageUnit"].values,
+                        )
+
+                        if not common_storage_store.empty:
+                            weighted_storage_mc_storage = storage_mc_storage[common_storage_store] * period_weight
+
+                            # Work with linopy variables directly for storage charge
+                            storage_p_store_subset = storage_p_store.sel(StorageUnit=common_storage_store)
+
+                            # Use xarray broadcasting for snapshot weights
+                            snapshot_weights_da = xr.DataArray(
+                                period_snapshot_weights.values,
+                                coords=[period_snapshots],
+                                dims=["snapshot"],
+                            )
+
+                            # Vectorized calculation: (MW) * (h) * ($/MW/h) = $
+                            weighted_store = storage_p_store_subset * snapshot_weights_da
+
+                            # Convert marginal costs to xarray DataArray with proper coordinates
+                            weighted_storage_mc_storage_da = xr.DataArray(
+                                weighted_storage_mc_storage.values,
+                                coords=[common_storage_store],
+                                dims=["StorageUnit"],
+                            )
+
+                            storage_opex += (weighted_store * weighted_storage_mc_storage_da).sum()
+
+                logger.info("  Added storage OPEX with proper vectorized units: MW * h * ($/MW/h)")
+                logger.info(f"  Total snapshot weights: {period_snapshot_weights.sum():.0f} hours")
+            else:
+                logger.info("  No storage marginal costs found")
+        else:
+            logger.info("  No storage units found for OPEX calculation")
+
+        logger.info(f"Total storage CAPEX (period-weighted): {storage_capex}")
+        logger.info(f"Total storage OPEX (period-weighted): {storage_opex}")
+        logger.info("Storage cost calculation completed with proper weighting")
+
+        # Use the properly calculated cost limit from reference network
+        # cost_limit was calculated above from existing_n.statistics with proper period weighting
+        logger.info(f"Using calculated cost limit with period weighting: ${cost_limit / 1e9:.2f}B")
+
+        # 🔍 DEBUGGING: Let's verify our constraint makes sense
+        logger.info("🔍 CONSTRAINT DEBUGGING:")
+        logger.info(f"  Current network has {len(n.generators)} total generators ({len(ext_gens)} extendable)")
+        logger.info(f"  Current network has {len(n.storage_units)} total storage units ({len(ext_storage)} extendable)")
+        logger.info("  Reference network CAPEX by component type:")
+        ref_capex_by_component = existing_n.statistics.capex().groupby(level=0).sum()
+        for comp, cost in ref_capex_by_component.items():
+            cost_value = cost.sum() if hasattr(cost, "sum") else cost
+            logger.info(f"    {comp}: ${cost_value / 1e9:.2f}B")
+        logger.info("  Reference network OPEX by component type:")
+        ref_opex_by_component = existing_n.statistics.opex().groupby(level=0).sum()
+        for comp, cost in ref_opex_by_component.items():
+            cost_value = cost.sum() if hasattr(cost, "sum") else cost
+            logger.info(f"    {comp}: ${cost_value / 1e9:.2f}B")
+
+        # Check minimum possible costs in current network
+        min_gen_capex_cost = (ext_gens.capital_cost * 0).sum() if not ext_gens.empty else 0
+        min_storage_capex_cost = (ext_storage.capital_cost * 0).sum() if not ext_storage.empty else 0
+        min_total_capex = min_gen_capex_cost + min_storage_capex_cost
+        logger.info(f"  Minimum possible CAPEX (all capacities = 0): ${min_total_capex / 1e9:.2f}B")
+        logger.info(f"  Available budget: ${cost_limit / 1e9:.2f}B")
+        logger.info(f"  Budget constraint mathematically feasible: {cost_limit >= min_total_capex}")
+
+        # Estimate minimum OPEX needed to serve load
+        total_load = n.loads_t.p_set.loc[period_snapshots].sum().sum()
+        logger.info(f"  Total load to serve: {total_load / 1e6:.1f} TWh")
+        if not n.generators.empty:
+            min_marginal_cost = n.generators.loc[n.generators.marginal_cost >= 0, "marginal_cost"].min()
+            if not pd.isna(min_marginal_cost):
+                min_opex_estimate = total_load * min_marginal_cost * period_weight
+                logger.info(
+                    f"  Estimated minimum OPEX (cheapest generator @ ${min_marginal_cost:.2f}/MWh): ${min_opex_estimate / 1e9:.2f}B",
+                )
+                remaining_budget = cost_limit - min_opex_estimate
+                logger.info(f"  Remaining budget for CAPEX: ${remaining_budget / 1e9:.2f}B")
+                if remaining_budget < 0:
+                    logger.error("  ❌ INFEASIBILITY SOURCE: Cannot serve load within cost budget!")
+                    logger.error("     Even with zero CAPEX, minimum OPEX exceeds budget")
+                else:
+                    logger.info("  ✅ Basic feasibility check passed")
+
+        # 5. Total generator + storage cost constraint using GlobalConstraint approach
+        # This now includes:
+        # - Generator CAPEX and OPEX
+        # - Storage CAPEX and OPEX
+        # - Period weighting for proper discounting across investment periods
+        # - Active asset checking (when available)
+        # - Proper snapshot weighting for operational costs
+
+        total_constrained_cost = gen_capex + gen_opex + storage_capex + storage_opex  # Period-weighted constraint
+        constraint_name = f"gen_storage_full_cost_constraint_{period}"
+
+        # 🔍 ENHANCED CONSTRAINT ANALYSIS: Analyze the linear expression structure
+        logger.info(f"🔍 ENHANCED CONSTRAINT ANALYSIS for period {period}:")
+        logger.info(f"  Linear expression has {len(total_constrained_cost.coeffs):,} terms")
+
+        # Analyze coefficient structure
+        coeffs_sum = float(total_constrained_cost.coeffs.sum())
+        logger.info(f"  Sum of all coefficients: ${coeffs_sum / 1e9:.3f}B")
+        logger.info(f"  Coefficient sum as % of cost limit: {coeffs_sum / cost_limit * 100:.2f}%")
+
+        # Analyze coefficient distribution
+        coeffs_array = total_constrained_cost.coeffs.values
+        non_zero_coeffs = coeffs_array[coeffs_array != 0]
+        logger.info(f"  Non-zero coefficients: {len(non_zero_coeffs):,} out of {len(coeffs_array):,}")
+
+        # breakpoint()
 
         # Following the simple example: use GlobalConstraint + manual constraint addition
         # This is cleaner and follows PyPSA conventions
@@ -630,7 +932,7 @@ def add_constant_cost_constraints(n, sns, config, ref_year):
         n.add(
             "GlobalConstraint",
             constraint_name,
-            type="custom_generator_cost_limit",  # Custom type
+            type="custom_gen_storage_cost_limit",  # Custom type
             sense="<=",
             constant=cost_limit,
             carrier_attribute="",
@@ -639,12 +941,12 @@ def add_constant_cost_constraints(n, sns, config, ref_year):
         # Read the GlobalConstraint and add it to the Linopy model
         row = n.global_constraints.loc[constraint_name]
         n.model.add_constraints(
-            total_generator_cost <= row["constant"],
+            total_constrained_cost <= row["constant"],
             name=constraint_name,
         )
 
         logger.info(
-            f"✅ Added FULL constraint for period {period}: generator_capex + generator_opex <= ${cost_limit / 1e9:.2f}B",
+            f"✅ Added GENERATOR + STORAGE constraint for period {period}: gen_capex + gen_opex + storage_capex + storage_opex <= ${cost_limit / 1e9:.2f}B",
         )
 
         # Validate the constraint
@@ -1283,6 +1585,7 @@ def add_regional_co2limit(n, sns, config):
 
         # Emitting Gens
         p_em = n.model["Generator-p"].loc[:, region_gens_em.index].sel(period=planning_horizon)
+        # breakpoint()
         lhs = (p_em * em_pu).sum()
         # breakpoint()
         rhs = region_co2lim
