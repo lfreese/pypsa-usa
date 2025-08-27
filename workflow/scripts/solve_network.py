@@ -24,6 +24,7 @@ Additionally, some extra constraints specified in :mod:`solve_network` are added
 """
 
 import copy
+import inspect
 import logging
 import os
 import re
@@ -42,7 +43,7 @@ from _helpers import (
 )
 from constants import NG_MWH_2_MMCF
 from eia import Trade
-from pypsa.descriptors import get_committable_i, nominal_attrs
+from linopy import LinearExpression, QuadraticExpression
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,7 @@ def add_land_use_constraints(n):
     definition of land_region enables sub-bus level land-use
     constraints.
     """
+    # breakpoint()
     model = n.model
     generators = n.generators.query(
         "p_nom_extendable & land_region != '' ",
@@ -207,848 +209,251 @@ lookup = pd.read_csv(
 )
 
 
-def save_unsolved_network(n, planning_horizon, intermed_networks_dir, **kwargs):
-    """
-    Save the network before optimization for a specific planning horizon.
-
-    Parameters
-    ----------
-    n : pypsa.Network
-        The PyPSA network object
-    planning_horizon : str or int
-        The current planning horizon
-    output_dir : str
-        Directory to save the unsolved network to
-    """
-    import os
-
-    # Make sure the output directory exists
-    os.makedirs(intermed_networks_dir, exist_ok=True)
-
-    # Create a deep copy of the network to avoid modifying the original
-    unsolved_n = n  # .copy()
-
-    # Add metadata
-    unsolved_n.meta = {"planning_horizon": planning_horizon, "status": "unsolved"}
-
-    # Save to netcdf
-    output_file = os.path.join(intermed_networks_dir, f"unsolved_network_{planning_horizon}.nc")
-    logger.info(f"Saving unsolved network for planning horizon {planning_horizon} to {output_file}")
-    unsolved_n.export_to_netcdf(output_file)
-
-    return output_file
-
-
-def save_solved_network(n, planning_horizon, output_dir):
-    """
-    Save the network after optimization for a specific planning horizon.
-
-    Parameters
-    ----------
-    n : pypsa.Network
-        The PyPSA network object that has been solved
-    planning_horizon : str or int
-        The current planning horizon
-    output_dir : str
-        Directory to save the solved network to
-    """
-    import os
-
-    # Make sure the output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Create a deep copy of the network to avoid modifying the original
-    solved_n = n  # .copy()
-
-    # Add metadata about the objective value
-    solved_n.meta = {
-        "planning_horizon": planning_horizon,
-        "status": "solved",
-        "objective_value": float(n.objective) if hasattr(n, "objective") else None,
-        "objective_constant": float(n.objective_constant) if hasattr(n, "objective_constant") else 0,
-    }
-
-    # Save to netcdf
-    output_file = os.path.join(output_dir, f"solved_network_{planning_horizon}.nc")
-    logger.info(f"Saving solved network for planning horizon {planning_horizon} to {output_file}")
-    logger.info(f"Objective value: {solved_n.meta['objective_value']}")
-    solved_n.export_to_netcdf(output_file)
-
-    return output_file
-
-
-def save_objective_expression(n, planning_horizon, output_dir, **kwargs):
-    """
-    Build a model for the network and save the objective expression without solving.
-
-    Parameters
-    ----------
-    n : pypsa.Network
-        The PyPSA network object
-    planning_horizon : str or int
-        The current planning horizon
-    output_dir : str
-        Directory to save the objective to
-
-    Returns
-    -------
-    output_file : str
-        Path to the saved file
-    """
-    import os
-
-    from pypsa.optimization.optimize import create_model
-
-    # Make sure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Create a copy of the network to avoid modifying the original
-    n_copy = n
-
-    # Get appropriate snapshots for this planning horizon
-    sns = n.snapshots[n.snapshots.get_level_values(0) == planning_horizon]
-
-    # Create the model without solving it
-    logger.info(f"Building model to extract objective expression for {planning_horizon}")
-    # Filter out kwargs that aren't needed for model creation
-    model_kwargs = {
-        k: v
-        for k, v in kwargs.items()
-        if k
-        in [
-            "transmission_losses",
-            "linearized_unit_commitment",
-            "multi_investment_periods",
-        ]
-    }
-
-    model = create_model(
-        n_copy,
-        snapshots=sns,
-        **model_kwargs,
+def log_create_model_call(n, *args, **kwargs):
+    logger.warning(
+        f"CALLING create_model on network id={id(n)}. "
+        f"Current n.model id={id(getattr(n, 'model', None))}. "
+        f"Called from: {inspect.stack()[1].function}",
     )
-    from pathlib import Path  # Add this import
-
-    # Save the model to LP format instead of trying to save just the objective
-    output_file = os.path.join(output_dir, f"model_{planning_horizon}.mps")
-    # Convert the string path to a Path object
-    output_path = Path(output_file)
-    # breakpoint()
-    # # Extract coefficients and variable names
-    # objective_expr = model.objective
-    # coefficients = objective_expr.coeffs
-    # variables = objective_expr.vars
-    # index = pd.MultiIndex.from_tuples([tuple(var.name) for var in variables], names=['variable_i', 'variable_j'])
-
-    # # Create a Pandas Series
-    # objective_series = pd.Series(data=coefficients, index=index)
-
-    # print(objective_series)
-    model.to_file(output_path)
-    import json
-
-    # Save metadata separately
-    metadata_file = os.path.join(output_dir, f"metadata_{planning_horizon}.json")
-    with open(metadata_file, "w") as f:
-        json.dump(
-            {
-                "planning_horizon": planning_horizon,
-                "network_info": {
-                    "buses": len(n.buses),
-                    "generators": len(n.generators),
-                    "links": len(n.links),
-                    "storage_units": len(n.storage_units),
-                },
-            },
-            f,
-        )
-
-    logger.info(f"Saved model with objective to {output_file}")
-    return output_file
+    result = pypsa.optimization.optimize.create_model(n, *args, **kwargs)
+    logger.warning(
+        f"RETURN from create_model: n.model id is now {id(n.model)}.",
+    )
+    return result
 
 
-def parse_lp_file_objective(lp_file_path):
-    """Parse an LP file to extract the objective function as text."""
-    import re
+def constant_cost(n, config, ref_year):  # , **kwargs):
+    """Based on conversation with Koen and based on approach for MGA.
 
-    with open(lp_file_path) as f:
-        lp_content = f.read()
-
-    # Extract objective section (between "Minimize" and "Subject To")
-    objective_pattern = re.compile(r"Minimize\s+(.*?)Subject To", re.DOTALL)
-    match = objective_pattern.search(lp_content)
-
-    if match:
-        objective_text = match.group(1).strip()
-        logger.info("Successfully extracted objective from LP file")
-        return objective_text
-    else:
-        logger.error("Could not extract objective from LP file")
-        return None
-        # m = parse_lp_file_objective(obj_expr_file)
-    # breakpoint()
-
-
-def calculate_total_cost(n, ref_year):
-    """Calculate total cost in the same way as the objective function."""
-    total_cost = 0
-
-    # Get snapshots for the year
-    year_snapshots = n.snapshots[n.snapshots.get_level_values(0) == ref_year]
-
-    # Get weightings for that year
-    weightings = n.snapshot_weightings.objective.loc[year_snapshots]
-
-    # 1. Capital costs (capex) - include all components, not just extendable
-    for c, attr in nominal_attrs.items():
-        # Get all components of this type that have a capital cost
-        capacity_costs = n.df(c)["capital_cost"]
-        if capacity_costs.empty:
-            continue
-
-        # Handle extendable and non-extendable components differently
-        ext_i = n.get_extendable_i(c)
-        non_ext_i = capacity_costs.index.difference(ext_i)
-
-        # For extendable components, use optimal capacity
-        if not ext_i.empty:
-            ext_caps = n.df(c)[f"{attr}_opt"][ext_i]
-            total_cost += (ext_caps * capacity_costs[ext_i]).sum()
-
-        # For non-extendable components, use p_nom
-        if not non_ext_i.empty:
-            non_ext_caps = n.df(c)[attr][non_ext_i]
-            total_cost += (non_ext_caps * capacity_costs[non_ext_i]).sum()
-
-    # 2. Operational costs (opex) - include all components with marginal costs
-
-    for cost_type in ["marginal_cost", "marginal_cost_storage", "spill_cost"]:
-        for c, attr in lookup.query(cost_type).index:
-            # Get all components with this cost type
-            cost = n.df(c)[cost_type]
-            if cost.empty:
-                continue
-
-            # Get the operational values - handle different component types
-            if c == "Generator":
-                operation = n.pnl(c)["p"]
-            elif c == "StorageUnit":
-                operation = n.pnl(c)["p_dispatch"] - n.pnl(c)["p_store"]
-            elif c == "Store":
-                operation = n.pnl(c)["p"]
-            elif c == "Link":
-                operation = n.pnl(c)["p0"]
-            else:
-                continue
-
-            if operation.empty:
-                continue
-
-            # Filter to columns in both operation and cost
-            common_cols = operation.columns.intersection(cost.index)
-            if common_cols.empty:
-                continue
-
-            # Weight the operations
-            weighted_operation = operation[common_cols].mul(weightings, axis=0)
-            total_cost += (weighted_operation * cost[common_cols]).sum().sum()
-
-    # 3. Stand-by costs for all components (not just extendable)
-    comps = {"Generator", "Link"}
-    for c in comps:
-        com_i = get_committable_i(n, c)
-        if com_i.empty:
-            continue
-
-        stand_by_cost = n.df(c)["stand_by_cost"][com_i]
-        if stand_by_cost.empty:
-            continue
-
-        # Get the status values
-        status = n.pnl(c)["status"]
-        if status.empty:
-            continue
-
-        # Filter to columns in both status and stand_by_cost
-        common_cols = status.columns.intersection(stand_by_cost.index)
-        if common_cols.empty:
-            continue
-
-        # Weight the status
-        weighted_status = status[common_cols].mul(weightings, axis=0)
-        total_cost += (weighted_status * stand_by_cost[common_cols]).sum().sum()
-
-    # 4. Unit commitment costs for all components
-    # keys = ["start_up", "shut_down"]
-    for c, attr in lookup.query("variable in @keys").index:
-        com_i = n.get_committable_i(c)
-        cost = n.df(c)[f"{attr}_cost"].reindex(com_i)
-        if cost.empty:
-            continue
-
-        # Get the commitment values
-        var = n.pnl(c)[attr]
-        if var.empty:
-            continue
-
-        # Filter to columns in both var and cost
-        common_cols = var.columns.intersection(cost.index)
-        if common_cols.empty:
-            continue
-
-        total_cost += (var[common_cols] * cost[common_cols]).sum().sum()
-
-    return total_cost
-
-
-def add_constant_cost_constraints(n, sns, config, ref_year):
+    Parameters
+    ----------
+    n : pypsa.Network
+        The PyPSA network object.
+    config : dict
+        Configuration dictionary containing various settings.
+    ref_year : int
+        The reference year for existing cost calculations. This must be a year in the existing_n file.
     """
-    Add a constant cost constraint to the network using PyPSA model variables directly.
-    This approach mirrors my simple example: capex + opex <= cost_limit.
-    """
-    logger.info("Adding constant cost constraint using PyPSA model variables.")
-
-    foresight = config["foresight"]
-    logger.info(f"Using {foresight} foresight")
-    periods = sns.unique("period")
-
-    # Load reference network to get cost limits
-    logger.info("Loading reference network for cost constraints")
-    intermed_networks_dir = os.path.join(config["electricity"]["cost_constraints_path"], "unsolved_networks")
-    input_file = os.path.join(intermed_networks_dir, "solved_network_2030.nc")
-
-    if not os.path.exists(input_file):
-        logger.error(f"Reference network file not found: {input_file}")
-        raise FileNotFoundError(f"Could not find reference network at {input_file}")
-
-    existing_n = pypsa.Network(input_file)
-    logger.info(f"Loaded reference network from: {input_file}")
-
-    # Add cost constraint for each period
-    for period in periods:
-        logger.info(f"Adding cost constraint for period {period}")
-
-        # Get reference cost limit for this period using PyPSA statistics
-        try:
-            ref_capex = existing_n.statistics.capex()
-            ref_opex = existing_n.statistics.opex()
-
-            # DEBUG: Log the raw statistics
-            logger.info(f"DEBUG: Raw ref_capex type: {type(ref_capex)}")
-            logger.info(f"DEBUG: Raw ref_capex index: {ref_capex.index if hasattr(ref_capex, 'index') else 'No index'}")
-            logger.info(f"DEBUG: Raw ref_opex type: {type(ref_opex)}")
-            logger.info(f"DEBUG: Raw ref_opex index: {ref_opex.index if hasattr(ref_opex, 'index') else 'No index'}")
-
-            if isinstance(ref_capex.index, pd.MultiIndex) and "period" in ref_capex.index.names:
-                # For multi-period: get costs only for the first time period
-                period_ref_capex = (
-                    ref_capex.loc[2030].sum().sum()  # use the first time period to set costs for all future ones
-                )
-                period_ref_opex = (
-                    ref_opex.loc[2030].sum().sum()  # use the first time period to set costs for all future ones
-                )
-                logger.info(f"DEBUG: Multi-period reference - using only period {period} costs")
-            else:
-                # For single-period: use all costs
-                period_ref_capex = ref_capex.sum().sum() if hasattr(ref_capex, "sum") else 0
-                period_ref_opex = ref_opex.sum().sum() if hasattr(ref_opex, "sum") else 0
-                logger.info("DEBUG: Single-period reference - using all costs")
-
-            # DEBUG: Log the individual components
-            logger.info(f"DEBUG: period_ref_capex = ${period_ref_capex / 1e9:.2f}B")
-            logger.info(f"DEBUG: period_ref_opex = ${period_ref_opex / 1e9:.2f}B")
-
-            # Apply period weighting to reference costs for consistency
-            if (
-                hasattr(existing_n, "investment_period_weightings")
-                and not existing_n.investment_period_weightings.empty
-            ):
-                ref_period_weight = existing_n.investment_period_weightings.get(period, 1.0)
-            else:
-                ref_period_weight = 1.0
-
-            # Apply the same period weighting logic as used in constraints
-            weighted_ref_capex = period_ref_capex * ref_period_weight
-            weighted_ref_opex = period_ref_opex * ref_period_weight
-            base_cost_limit = weighted_ref_capex + weighted_ref_opex
-
-            # Apply CO₂ optimization budget multiplier if needed
-            opts_list = config.get("scenario", {}).get("opts", [])
-            has_co2obj = any("co2obj" in opt for opt in opts_list)
-            if has_co2obj:
-                co2_budget_multiplier = 10.0  # Allow 10x budget for CO₂ optimization (was 3x)
-                cost_limit = base_cost_limit * co2_budget_multiplier
-                logger.info(f"🎯 CO₂ optimization detected - applying {co2_budget_multiplier}x budget multiplier")
-                logger.info(f"   Base budget: ${base_cost_limit / 1e9:.2f}B")
-                logger.info(f"   CO₂ budget: ${cost_limit / 1e9:.2f}B")
-            else:
-                cost_limit = base_cost_limit
-                logger.info(f"Standard cost optimization budget: ${cost_limit / 1e9:.2f}B")
-
-            logger.info(f"DEBUG: Applied period weight {ref_period_weight} to reference costs")
-            logger.info(f"DEBUG: weighted_ref_capex = ${weighted_ref_capex / 1e9:.2f}B")
-            logger.info(f"DEBUG: weighted_ref_opex = ${weighted_ref_opex / 1e9:.2f}B")
-            logger.info(f"Period {period} reference cost limit (period-weighted): ${cost_limit / 1e9:.2f}B")
-
-        except Exception as e:
-            logger.warning(f"Could not calculate reference costs: {e}")
-            cost_limit = 11.9e9  # Fallback
-            logger.info(f"Using fallback cost limit: ${cost_limit / 1e9:.2f}B")
-
-        # Build constraint expression using PyPSA model variables (your approach)
-        logger.info(f"Building cost constraint expression for period {period}")
-
-        # Get period-specific snapshots
-        period_snapshots = sns[sns.get_level_values(0) == period]
-
-        # IMPROVED: Generator + Storage constraints with proper period weighting and active asset checking
-        logger.info("🎯 IMPROVED CONSTRAINT: Generator + Storage costs with period weighting and active assets")
-
-        # Get period weighting for this period (for discounting)
-        if hasattr(n, "investment_period_weightings") and not n.investment_period_weightings.empty:
-            period_weight = n.investment_period_weightings.get(period, 1.0)
-        else:
-            period_weight = 1.0  # Default if no period weightings
-
-        logger.info(f"Period {period} weight: {period_weight}")
-
-        # 1. Generator CAPEX: Include period weighting and active asset checking
-        gen_capex = 0
-        ext_gens = n.generators.query("p_nom_extendable")
-
-        if not ext_gens.empty:
-            # Check for active assets in this period
-            if hasattr(n.generators, "active") and hasattr(n.generators.active, "loc"):
-                try:
-                    # Get active generators for this period
-                    active_mask = n.generators.active.loc[period_snapshots, ext_gens.index].any(axis=0)
-                    active_ext_gens = ext_gens[active_mask]
-                    logger.info(
-                        f"  Found {len(active_ext_gens)} active extendable generators out of {len(ext_gens)} total",
-                    )
-                except (KeyError, AttributeError):
-                    # Fallback: assume all extendable generators are active
-                    active_ext_gens = ext_gens
-                    logger.info(
-                        f"  No active asset data found, assuming all {len(ext_gens)} extendable generators are active",
-                    )
-            else:
-                # Fallback: assume all extendable generators are active
-                active_ext_gens = ext_gens
-                logger.info(
-                    f"  No active asset tracking, assuming all {len(ext_gens)} extendable generators are active",
-                )
-
-            if not active_ext_gens.empty:
-                # Apply period weighting to capital costs
-                weighted_capital_costs = active_ext_gens.capital_cost * period_weight
-                # Filter p_nom variables to only the active extendable generators
-                gen_p_nom_vars = n.model.variables["Generator-p_nom"].loc[active_ext_gens.index]
-                # Use element-wise multiplication and sum (not dot product which creates outer product)
-                gen_capex = (gen_p_nom_vars * weighted_capital_costs).sum()
-                logger.info(
-                    f"  Added generator CAPEX for {len(active_ext_gens)} active generators with period weight {period_weight}",
-                )
-            else:
-                logger.info("  No active extendable generators found")
-        else:
-            logger.info("  No extendable generators found")
-
-        # 2. Generator OPEX: Include proper snapshot weighting for this period
-        gen_opex = 0
-        if not n.generators.empty:
-            logger.info("Adding generator OPEX with proper snapshot weighting...")
-
-            # Get marginal costs per generator ($/MW/h)
-            mc = n.generators.marginal_cost
-
-            # Get snapshot weightings for this specific period (hours)
-            period_snapshot_weights = n.snapshot_weightings.objective.loc[period_snapshots]
-
-            # Get generator power variables for this period (MW)
-            gen_p = n.model["Generator-p"].loc[period_snapshots, :]
-
-            # Filter to common generators
-            common_gens = mc.index.intersection(gen_p.coords["Generator"].values)
-            if not common_gens.empty:
-                # CORRECT UNITS: Use vectorized operations like PyPSA does
-                # This matches PyPSA's objective function calculation
-                weighted_mc = mc[common_gens] * period_weight  # Apply period weighting to marginal costs
-
-                # Work with linopy variables directly to avoid coordinate conflicts
-                # gen_p_subset has dimensions [snapshot, Generator] where snapshot = (period, timestep)
-                # period_snapshot_weights has index [snapshot] matching gen_p_subset's snapshot dimension
-                # weighted_mc has dimension [Generator] matching gen_p_subset's Generator dimension
-
-                # Select only the common generators from gen_p
-                gen_p_subset = gen_p.sel(Generator=common_gens)
-
-                # Create a proper weighting array that matches gen_p_subset dimensions
-                # Convert snapshot weights to xarray DataArray with matching coordinates
-                snapshot_weights_da = xr.DataArray(
-                    period_snapshot_weights.values,
-                    coords=[period_snapshots],
-                    dims=["snapshot"],
-                )
-
-                # Multiply power by snapshot weights: (MW) * (h) -> MWh
-                # This creates the weighted generation expression using xarray broadcasting
-                weighted_gen_p = gen_p_subset * snapshot_weights_da
-
-                # Apply marginal costs: (MWh) * ($/MW/h) -> $
-                # Convert weighted_mc to xarray DataArray with proper coordinates
-                weighted_mc_da = xr.DataArray(
-                    weighted_mc.values,
-                    coords=[common_gens],
-                    dims=["Generator"],
-                )
-
-                gen_opex = (weighted_gen_p * weighted_mc_da).sum()
-
-                logger.info(
-                    f"  Added generator OPEX for {len(common_gens)} generators with proper units: MW * h * ($/MW/h)",
-                )
-                logger.info(f"  Total snapshot weights: {period_snapshot_weights.sum():.0f} hours")
-            else:
-                logger.info("  No common generators found between marginal costs and power variables")
-        else:
-            logger.info("  No generators found for OPEX calculation")
-
-        logger.info(f"Total generator CAPEX (period-weighted): {gen_capex}")
-        logger.info(f"Total generator OPEX (period-weighted): {gen_opex}")
-        logger.info("Generator cost calculation completed with proper weighting")
-
-        # 3. Storage CAPEX: Include period weighting and active asset checking
-        storage_capex = 0
-        ext_storage = n.storage_units.query("p_nom_extendable") if not n.storage_units.empty else pd.DataFrame()
-
-        if not ext_storage.empty:
-            # Check for active storage assets in this period
-            if hasattr(n.storage_units, "active") and hasattr(n.storage_units.active, "loc"):
-                try:
-                    # Get active storage units for this period
-                    active_mask = n.storage_units.active.loc[period_snapshots, ext_storage.index].any(axis=0)
-                    active_ext_storage = ext_storage[active_mask]
-                    logger.info(
-                        f"  Found {len(active_ext_storage)} active extendable storage units out of {len(ext_storage)} total",
-                    )
-                except (KeyError, AttributeError):
-                    # Fallback: assume all extendable storage units are active
-                    active_ext_storage = ext_storage
-                    logger.info(
-                        f"  No active storage asset data found, assuming all {len(ext_storage)} extendable storage units are active",
-                    )
-            else:
-                # Fallback: assume all extendable storage units are active
-                active_ext_storage = ext_storage
-                logger.info(
-                    f"  No active storage asset tracking, assuming all {len(ext_storage)} extendable storage units are active",
-                )
-
-            if not active_ext_storage.empty:
-                # Apply period weighting to storage capital costs
-                weighted_storage_capital_costs = active_ext_storage.capital_cost * period_weight
-                # Filter p_nom variables to only the active extendable storage units
-                storage_p_nom_vars = n.model.variables["StorageUnit-p_nom"].loc[active_ext_storage.index]
-                # Use element-wise multiplication and sum (not dot product which creates outer product)
-                storage_capex = (storage_p_nom_vars * weighted_storage_capital_costs).sum()
-                logger.info(
-                    f"  Added storage CAPEX for {len(active_ext_storage)} active storage units with period weight {period_weight}",
-                )
-            else:
-                logger.info("  No active extendable storage units found")
-        else:
-            logger.info("  No extendable storage units found")
-
-        # 4. Storage OPEX: Include marginal costs for storage
-        storage_opex = 0
-        if not n.storage_units.empty:
-            logger.info("Adding storage OPEX with proper snapshot weighting...")
-
-            # Get marginal costs per storage unit ($/MW/h)
-            storage_mc = n.storage_units.get("marginal_cost", pd.Series(dtype=float))
-            storage_mc_storage = n.storage_units.get("marginal_cost_storage", pd.Series(dtype=float))
-
-            if not storage_mc.empty or not storage_mc_storage.empty:
-                # Get snapshot weightings for this specific period (hours)
-                period_snapshot_weights = n.snapshot_weightings.objective.loc[period_snapshots]
-
-                storage_opex = 0
-
-                # Handle marginal_cost for storage dispatch ($/MW/h)
-                if not storage_mc.empty:
-                    # Get storage power variables for this period (MW)
-                    # For storage, we need both dispatch and store power
-                    if "StorageUnit-p_dispatch" in n.model.variables:
-                        storage_p_dispatch = n.model["StorageUnit-p_dispatch"].loc[period_snapshots, :]
-                        common_storage = storage_mc.index.intersection(storage_p_dispatch.coords["StorageUnit"].values)
-
-                        if not common_storage.empty:
-                            weighted_storage_mc = storage_mc[common_storage] * period_weight
-
-                            # Work with linopy variables directly for storage dispatch
-                            storage_p_subset = storage_p_dispatch.sel(StorageUnit=common_storage)
-
-                            # Use xarray broadcasting for snapshot weights
-                            snapshot_weights_da = xr.DataArray(
-                                period_snapshot_weights.values,
-                                coords=[period_snapshots],
-                                dims=["snapshot"],
-                            )
-
-                            # Vectorized calculation: (MW) * (h) * ($/MW/h) = $
-                            weighted_dispatch = storage_p_subset * snapshot_weights_da
-
-                            # Convert marginal costs to xarray DataArray with proper coordinates
-                            weighted_storage_mc_da = xr.DataArray(
-                                weighted_storage_mc.values,
-                                coords=[common_storage],
-                                dims=["StorageUnit"],
-                            )
-
-                            storage_opex += (weighted_dispatch * weighted_storage_mc_da).sum()
-
-                # Handle marginal_cost_storage for storage charge operations ($/MW/h)
-                if not storage_mc_storage.empty:
-                    if "StorageUnit-p_store" in n.model.variables:
-                        storage_p_store = n.model["StorageUnit-p_store"].loc[period_snapshots, :]
-                        common_storage_store = storage_mc_storage.index.intersection(
-                            storage_p_store.coords["StorageUnit"].values,
-                        )
-
-                        if not common_storage_store.empty:
-                            weighted_storage_mc_storage = storage_mc_storage[common_storage_store] * period_weight
-
-                            # Work with linopy variables directly for storage charge
-                            storage_p_store_subset = storage_p_store.sel(StorageUnit=common_storage_store)
-
-                            # Use xarray broadcasting for snapshot weights
-                            snapshot_weights_da = xr.DataArray(
-                                period_snapshot_weights.values,
-                                coords=[period_snapshots],
-                                dims=["snapshot"],
-                            )
-
-                            # Vectorized calculation: (MW) * (h) * ($/MW/h) = $
-                            weighted_store = storage_p_store_subset * snapshot_weights_da
-
-                            # Convert marginal costs to xarray DataArray with proper coordinates
-                            weighted_storage_mc_storage_da = xr.DataArray(
-                                weighted_storage_mc_storage.values,
-                                coords=[common_storage_store],
-                                dims=["StorageUnit"],
-                            )
-
-                            storage_opex += (weighted_store * weighted_storage_mc_storage_da).sum()
-
-                logger.info("  Added storage OPEX with proper vectorized units: MW * h * ($/MW/h)")
-                logger.info(f"  Total snapshot weights: {period_snapshot_weights.sum():.0f} hours")
-            else:
-                logger.info("  No storage marginal costs found")
-        else:
-            logger.info("  No storage units found for OPEX calculation")
-
-        logger.info(f"Total storage CAPEX (period-weighted): {storage_capex}")
-        logger.info(f"Total storage OPEX (period-weighted): {storage_opex}")
-        logger.info("Storage cost calculation completed with proper weighting")
-
-        # Use the properly calculated cost limit from reference network
-        # cost_limit was calculated above from existing_n.statistics with proper period weighting
-        logger.info(f"Using calculated cost limit with period weighting: ${cost_limit / 1e9:.2f}B")
-
-        # 🔍 DEBUGGING: Let's verify our constraint makes sense
-        logger.info("🔍 CONSTRAINT DEBUGGING:")
-        logger.info(f"  Current network has {len(n.generators)} total generators ({len(ext_gens)} extendable)")
-        logger.info(f"  Current network has {len(n.storage_units)} total storage units ({len(ext_storage)} extendable)")
-        logger.info("  Reference network CAPEX by component type:")
-        ref_capex_by_component = existing_n.statistics.capex().groupby(level=0).sum()
-        for comp, cost in ref_capex_by_component.items():
-            cost_value = cost.sum() if hasattr(cost, "sum") else cost
-            logger.info(f"    {comp}: ${cost_value / 1e9:.2f}B")
-        logger.info("  Reference network OPEX by component type:")
-        ref_opex_by_component = existing_n.statistics.opex().groupby(level=0).sum()
-        for comp, cost in ref_opex_by_component.items():
-            cost_value = cost.sum() if hasattr(cost, "sum") else cost
-            logger.info(f"    {comp}: ${cost_value / 1e9:.2f}B")
-
-        # Check minimum possible costs in current network
-        min_gen_capex_cost = (ext_gens.capital_cost * 0).sum() if not ext_gens.empty else 0
-        min_storage_capex_cost = (ext_storage.capital_cost * 0).sum() if not ext_storage.empty else 0
-        min_total_capex = min_gen_capex_cost + min_storage_capex_cost
-        logger.info(f"  Minimum possible CAPEX (all capacities = 0): ${min_total_capex / 1e9:.2f}B")
-        logger.info(f"  Available budget: ${cost_limit / 1e9:.2f}B")
-        logger.info(f"  Budget constraint mathematically feasible: {cost_limit >= min_total_capex}")
-
-        # Estimate minimum OPEX needed to serve load
-        total_load = n.loads_t.p_set.loc[period_snapshots].sum().sum()
-        logger.info(f"  Total load to serve: {total_load / 1e6:.1f} TWh")
-        if not n.generators.empty:
-            min_marginal_cost = n.generators.loc[n.generators.marginal_cost >= 0, "marginal_cost"].min()
-            if not pd.isna(min_marginal_cost):
-                min_opex_estimate = total_load * min_marginal_cost * period_weight
-                logger.info(
-                    f"  Estimated minimum OPEX (cheapest generator @ ${min_marginal_cost:.2f}/MWh): ${min_opex_estimate / 1e9:.2f}B",
-                )
-                remaining_budget = cost_limit - min_opex_estimate
-                logger.info(f"  Remaining budget for CAPEX: ${remaining_budget / 1e9:.2f}B")
-                if remaining_budget < 0:
-                    logger.error("  ❌ INFEASIBILITY SOURCE: Cannot serve load within cost budget!")
-                    logger.error("     Even with zero CAPEX, minimum OPEX exceeds budget")
-                else:
-                    logger.info("  ✅ Basic feasibility check passed")
-
-        # 5. Total generator + storage cost constraint using GlobalConstraint approach
-        # This now includes:
-        # - Generator CAPEX and OPEX
-        # - Storage CAPEX and OPEX
-        # - Period weighting for proper discounting across investment periods
-        # - Active asset checking (when available)
-        # - Proper snapshot weighting for operational costs
-
-        total_constrained_cost = gen_capex + gen_opex + storage_capex + storage_opex  # Period-weighted constraint
-        constraint_name = f"gen_storage_full_cost_constraint_{period}"
-
-        # 🔍 ENHANCED CONSTRAINT ANALYSIS: Analyze the linear expression structure
-        logger.info(f"🔍 ENHANCED CONSTRAINT ANALYSIS for period {period}:")
-        logger.info(f"  Linear expression has {len(total_constrained_cost.coeffs):,} terms")
-
-        # Analyze coefficient structure
-        coeffs_sum = float(total_constrained_cost.coeffs.sum())
-        logger.info(f"  Sum of all coefficients: ${coeffs_sum / 1e9:.3f}B")
-        logger.info(f"  Coefficient sum as % of cost limit: {coeffs_sum / cost_limit * 100:.2f}%")
-
-        # Analyze coefficient distribution
-        coeffs_array = total_constrained_cost.coeffs.values
-        non_zero_coeffs = coeffs_array[coeffs_array != 0]
-        logger.info(f"  Non-zero coefficients: {len(non_zero_coeffs):,} out of {len(coeffs_array):,}")
-
-        # breakpoint()
-
-        # Following the simple example: use GlobalConstraint + manual constraint addition
-        # This is cleaner and follows PyPSA conventions
-        logger.info(f"Adding GlobalConstraint for cost limit: ${cost_limit / 1e9:.2f}B")
-
-        # Add the GlobalConstraint to the network (like the simple example)
-        n.add(
-            "GlobalConstraint",
-            constraint_name,
-            type="custom_gen_storage_cost_limit",  # Custom type
-            sense="<=",
-            constant=cost_limit,
-            carrier_attribute="",
-        )
-
-        # Read the GlobalConstraint and add it to the Linopy model
-        row = n.global_constraints.loc[constraint_name]
-        n.model.add_constraints(
-            total_constrained_cost <= row["constant"],
-            name=constraint_name,
-        )
-
-        logger.info(
-            f"✅ Added GENERATOR + STORAGE constraint for period {period}: gen_capex + gen_opex + storage_capex + storage_opex <= ${cost_limit / 1e9:.2f}B",
-        )
-
-        # Validate the constraint
-        validate_constraint_calculation(existing_n, period, cost_limit)
-
-        # Debug: Analyze constraint tightness for full generator constraint
-        logger.info(f"🔍 CONSTRAINT ANALYSIS for period {period} (FULL GENERATOR CONSTRAINT):")
-
-        # Check if constraint could be causing infeasibility
-        # Calculate minimum possible generator costs
-        min_gen_capex = (ext_gens.capital_cost * 0).sum() if not ext_gens.empty else 0
-        min_total_capex = min_gen_capex
-
-        logger.info(f"  Minimum possible generator CAPEX (all capacities = 0): ${min_total_capex / 1e9:.2f}B")
-        logger.info(f"  Available budget: ${cost_limit / 1e9:.2f}B")
-        logger.info(f"  Budget constraint feasible: {cost_limit > min_total_capex}")
-
-        # Check minimum generation requirements vs costs
-        total_load = n.loads_t.p_set.loc[period_snapshots].sum().sum()
-        logger.info(f"  Total load to serve in period {period}: {total_load / 1e6:.1f} TWh")
-
-        # Check cheapest generation option costs
-        if not n.generators.empty:
-            cheapest_gen = n.generators.loc[n.generators.marginal_cost > 0, "marginal_cost"].min()
-            min_opex_estimate = total_load * cheapest_gen if not pd.isna(cheapest_gen) else 0
-            logger.info(f"  Estimated minimum generator OPEX (cheapest generator): ${min_opex_estimate / 1e9:.2f}B")
-            logger.info(f"  Remaining budget for generator CAPEX: ${(cost_limit - min_opex_estimate) / 1e9:.2f}B")
-            logger.info("  Full constraint includes both CAPEX and OPEX components")
-
-        # Validate the constraint calculation
-        validate_constraint_calculation(existing_n, period, cost_limit)
-
-
-def validate_constraint_calculation(existing_n, period, cost_limit):
-    """Validate that our constraint limit matches PyPSA statistics for the reference network."""
-    try:
-        # Calculate what PyPSA statistics gives us for the reference network
-        ref_capex = existing_n.statistics.capex().sum().sum() if hasattr(existing_n.statistics.capex(), "sum") else 0
-        ref_opex = existing_n.statistics.opex().sum().sum() if hasattr(existing_n.statistics.opex(), "sum") else 0
-        reference_total = ref_capex + ref_opex
-
-        logger.info(f"CONSTRAINT VALIDATION for period {period}:")
-        logger.info(f"  Reference Network PyPSA CAPEX: ${ref_capex / 1e9:.2f}B")
-        logger.info(f"  Reference Network PyPSA OPEX:  ${ref_opex / 1e9:.2f}B")
-        logger.info(f"  Reference Network PyPSA Total: ${reference_total / 1e9:.2f}B")
-        logger.info(f"  Our Constraint Limit: ${cost_limit / 1e9:.2f}B")
-        logger.info(f"  Difference: ${abs(reference_total - cost_limit) / 1e9:.2f}B")
-
-        if abs(reference_total - cost_limit) > 1e6:  # > $1M difference
-            logger.warning("⚠️  Large discrepancy! Constraint limit doesn't match reference network PyPSA statistics.")
-        else:
-            logger.info("✅ Constraint limit closely matches reference network PyPSA statistics")
-
-    except Exception as e:
-        logger.warning(f"Could not validate constraint calculation: {e}")
+    # breakpoint()
+    # if snapshots.get_level_values(0)[0] == 2035:
+    #     breakpoint()
+    # pull costs from existing network
+    pathfile = config["electricity"]["cost_constraints_path"]
+
+    if not os.path.exists(pathfile):
+        logger.error(f"Reference network file not found: {pathfile}")
+        raise FileNotFoundError(f"Could not find reference network at {pathfile}")
+
+    existing_n = pypsa.Network(pathfile)
+    # period_sns = sns[sns.get_level_values("period") == period_values[0]]
+
+    optimal_cost = (existing_n.statistics.capex().sum() + existing_n.statistics.opex().sum())[ref_year]
+    fixed_cost = existing_n.statistics.installed_capex().sum()[ref_year]
+
+    # get the objective from our model
+    original_objective = n.model.objective
+    logger.info(f"HERE IMPORTANT OBJECTIVE INFO {n.snapshots}")
+    logger.info(original_objective)
+    # breakpoint()
+    if not isinstance(original_objective, LinearExpression | QuadraticExpression):
+        original_objective = original_objective.expression
+
+    name = "system_cost"
+    scale_factor = 1e-9
+
+    name = "system_cost"
+    if name in n.global_constraints.index:
+        n.global_constraints = n.global_constraints.drop(name)
+
+    n.add(
+        "GlobalConstraint",
+        name=name,
+        type="budget",
+        carrier_attribute="",
+        sense="<=",
+        constant=optimal_cost * scale_factor,
+    )
+
+    buffer = 1.5
+    n.model.add_constraints(
+        (original_objective + fixed_cost) * scale_factor <= optimal_cost * scale_factor * buffer,
+        name=f"GlobalConstraint-{name}",
+    )
+    logger.info("Added global cost constraint ")
+
+    logger.info(f"Created constant cost constraint: Total system cost <= ${optimal_cost / 1e9:.2f}B")
 
 
 def define_objective_co2(n, sns):
-    """
-    Defines and writes out the objective function for CO2 minimization.
-    This is used when 'co2obj' is in the options.
-    """
+    """Defines and writes out the objective function for CO2 minimization."""
     weightings = n.snapshot_weightings.loc[n.snapshots]
-    planning_horizons = sns.unique("period")
-
+    period = sns.unique("period") if "period" in sns.names else [sns[0]]
     total_emissions = 0
-    for period in planning_horizons:
-        period_sns = sns[sns.get_level_values("period") == period]
-        period_weighting = weightings.loc[period_sns]
 
-        emissions = n.carriers.co2_emissions.fillna(0)[lambda ds: ds != 0]
-        gens_em = n.generators.query("carrier in @emissions.index")
+    # breakpoint()
+    period_sns = sns[sns.get_level_values("period") == period.values[0]] if "period" in sns.names else sns
+    logger.info(f" DEBUG: Period for {period.values[0]}")
+    period_weighting = weightings.loc[period_sns, "generators"]
+    emissions = n.carriers.co2_emissions.fillna(0)
+    # emitting_carriers = emissions[emissions != 0].index
 
-        efficiency = get_as_dense(
-            n,
-            "Generator",
-            "efficiency",
-            inds=gens_em.index,
-        )  # mw_elect/mw_th
+    active_gens = n.get_active_assets("Generator", period)
+    gens_em = n.generators.loc[active_gens].query("carrier in @emitting_carriers")
 
-        # Calculate emissions per unit for this period
-        em_pu = gens_em.carrier.map(emissions) / efficiency  # tonnes_co2/mw_electrical
-        em_pu = em_pu.multiply(period_weighting.generators, axis=0).fillna(0)
+    efficiency = gens_em["efficiency"].replace(0, 1)
+    em_pu = gens_em["carrier"].map(emissions) / efficiency
+    p_em = n.model["Generator-p"].loc[period_sns, gens_em.index]
 
-        # Get generator power variables for this period
-        p_em = n.model["Generator-p"].loc[period_sns, gens_em.index]
+    # Convert em_pu to xarray with proper coordinates to match p_em
+    em_pu_xr = xr.DataArray(
+        em_pu.values,
+        coords=[em_pu.index],
+        dims=["Generator"],
+    )
 
-        # Add period emissions to total
-        period_emissions = (p_em * em_pu).sum()
-        total_emissions += period_emissions
+    # Convert period_weighting to xarray with proper coordinates
+    period_weighting_xr = xr.DataArray(
+        period_weighting.values,
+        coords=[period_weighting.index],
+        dims=["snapshot"],
+    )
 
-        logger.info(f"Period {period} emissions expression: {period_emissions}")
-
-    # Add a small penalty for emissions to encourage minimization
-    # while still allowing them to occur
-    penalty_factor = 1e-6  # Small penalty to encourage emission reduction
-    objective = total_emissions * penalty_factor
-
-    logger.info(f"CO2 objective defined with penalty factor {penalty_factor}.")
+    # Calculate emissions for this period
+    period_emissions = (p_em * em_pu_xr * period_weighting_xr).sum()
+    total_emissions += period_emissions
+    logger.info(f"Period {period} emissions expression: {period_emissions}")
+    # penalty_factor = 1e-6
+    objective = total_emissions  # * penalty_factor
+    # logger.info(f"CO2 objective defined with penalty factor {penalty_factor}.")
     logger.info(f"Total emissions expression: {total_emissions}")
+    return objective
 
-    return objective.sum()
+
+# def define_objective_co2(n, sns):
+#     """
+#     Defines and writes out the objective function for CO2 minimization.
+#     Includes emissions from generators, storage units, and links.
+#     """
+#     weightings = n.snapshot_weightings.loc[n.snapshots]
+#     planning_horizons = sns.unique("period") if "period" in sns.names else [sns[0]]
+#     total_emissions = 0
+
+#     for period in planning_horizons:
+#         #breakpoint()
+#         period_sns = sns[sns.get_level_values("period") == period] if "period" in sns.names else sns
+#         period_weighting_gen = weightings.loc[period_sns, "generators"]
+#         emissions = n.carriers.co2_emissions.fillna(0)
+#         emitting_carriers = emissions[emissions != 0].index
+#         period_emissions = 0
+
+#         # Convert period_weighting to xarray with proper coordinates
+#         period_weighting_xr = xr.DataArray(
+#             period_weighting_gen.values,
+#             coords=[period_weighting_gen.index],
+#             dims=["snapshot"]
+#         )
+
+#         # === GENERATORS ===
+#         gens_em = n.generators.query("carrier in @emitting_carriers")
+#         if not gens_em.empty:
+#             efficiency = gens_em["efficiency"].replace(0, 1)
+#             em_pu = gens_em["carrier"].map(emissions) / efficiency
+#             p_em = n.model["Generator-p"].loc[period_sns, gens_em.index]
+
+#             # Convert em_pu to xarray with proper coordinates to match p_em
+#             em_pu_xr = xr.DataArray(
+#                 em_pu.values,
+#                 coords=[em_pu.index],
+#                 dims=["Generator"]
+#             )
+
+#             # Calculate emissions for generators in this period
+#             gen_emissions = (p_em * em_pu_xr * period_weighting_xr).sum()
+#             period_emissions += gen_emissions
+#             logger.info(f"Period {period} generator emissions: {gen_emissions}")
+
+#         # === STORAGE UNITS ===
+#         if hasattr(n, 'storage_units') and not n.storage_units.empty:
+#             storage_em = n.storage_units.query("carrier in @emitting_carriers")
+#             if not storage_em.empty:
+#                 # For storage units, we consider both charging/discharging power and capacity
+#                 storage_efficiency = storage_em["efficiency_store"].replace(0, 1)
+#                 storage_em_pu = storage_em["carrier"].map(emissions) / storage_efficiency
+
+#                 # Storage power emissions (from operation)
+#                 if "StorageUnit-p" in n.model:
+#                     p_storage = n.model["StorageUnit-p"].loc[period_sns, storage_em.index]
+
+#                     # Convert to xarray
+#                     storage_em_pu_xr = xr.DataArray(
+#                         storage_em_pu.values,
+#                         coords=[storage_em_pu.index],
+#                         dims=["StorageUnit"]
+#                     )
+
+#                     storage_power_emissions = (p_storage * storage_em_pu_xr * period_weighting_xr).sum()
+#                     period_emissions += storage_power_emissions
+#                     logger.info(f"Period {period} storage power emissions: {storage_power_emissions}")
+
+#                 # Storage capacity emissions (from investment)
+#                 if "StorageUnit-p_nom" in n.model:
+#                     p_nom_storage = n.model["StorageUnit-p_nom"].loc[storage_em.index]
+#                     if hasattr(p_nom_storage, 'sum') and p_nom_storage.sum() != 0:
+#                         # Capacity emissions are typically annualized
+#                         storage_capacity_em_pu_xr = xr.DataArray(
+#                             storage_em_pu.values,
+#                             coords=[storage_em_pu.index],
+#                             dims=["StorageUnit"]
+#                         )
+#                         storage_capacity_emissions = (p_nom_storage * storage_capacity_em_pu_xr).sum()
+#                         period_emissions += storage_capacity_emissions
+#                         logger.info(f"Period {period} storage capacity emissions: {storage_capacity_emissions}")
+
+#         # === LINKS ===
+#         if hasattr(n, 'links') and not n.links.empty:
+#             links_em = n.links.query("carrier in @emitting_carriers")
+#             if not links_em.empty:
+#                 # For links, we consider both power flow and capacity
+#                 link_efficiency = links_em["efficiency"].replace(0, 1)
+#                 link_em_pu = links_em["carrier"].map(emissions) / link_efficiency
+
+#                 # Link power emissions (from operation)
+#                 if "Link-p" in n.model:
+#                     p_link = n.model["Link-p"].loc[period_sns, links_em.index]
+
+#                     # Convert to xarray
+#                     link_em_pu_xr = xr.DataArray(
+#                         link_em_pu.values,
+#                         coords=[link_em_pu.index],
+#                         dims=["Link"]
+#                     )
+
+#                     link_power_emissions = (p_link * link_em_pu_xr * period_weighting_xr).sum()
+#                     period_emissions += link_power_emissions
+#                     logger.info(f"Period {period} link power emissions: {link_power_emissions}")
+
+#                 # Link capacity emissions (from investment)
+#                 if "Link-p_nom" in n.model:
+#                     p_nom_link = n.model["Link-p_nom"].loc[links_em.index]
+#                     if hasattr(p_nom_link, 'sum') and p_nom_link.sum() != 0:
+#                         # Capacity emissions are typically annualized
+#                         link_capacity_em_pu_xr = xr.DataArray(
+#                             link_em_pu.values,
+#                             coords=[link_em_pu.index],
+#                             dims=["Link"]
+#                         )
+#                         link_capacity_emissions = (p_nom_link * link_capacity_em_pu_xr).sum()
+#                         period_emissions += link_capacity_emissions
+#                         logger.info(f"Period {period} link capacity emissions: {link_capacity_emissions}")
+
+#         total_emissions += period_emissions
+#         logger.info(f"Period {period} total emissions expression: {period_emissions}")
+
+#     penalty_factor = 1e-6
+#     objective = total_emissions * penalty_factor
+#     logger.info(f"CO2 objective defined with penalty factor {penalty_factor}.")
+#     logger.info(f"Total emissions expression: {total_emissions}")
+#     return objective
 
 
 def add_technology_capacity_target_constraints(n, config):
@@ -2529,6 +1934,18 @@ def extra_functionality(n, snapshots):
     """
     opts = n.opts
     config = n.config
+
+    logger.warning(f"extra_functionality: network id={id(n)}, n.model id={id(getattr(n, 'model', None))}")
+
+    ref_year = config["scenario"]["ref_year"]
+    if (  ###has to be first, this is where we create the cost constraint
+        "CC" in opts and n.generators.p_nom_extendable.any()
+    ):  # and snapshots.unique('period') != n.investment_periods[0]:
+        print("\nAPPLYING COST CONSTRAINT (CC option detected)")
+        print(f"Options string: {'-'.join(opts)}")
+        # add_cost_constraint_based_on_calculation(n, snapshots, config, ref_year)
+        constant_cost(n, config, ref_year)  # , **kwargs)
+
     if "RPS" in opts and n.generators.p_nom_extendable.any():
         sector_rps = True if "sector" in opts else False
         add_RPS_constraints(n, snapshots, config, sector_rps)
@@ -2571,25 +1988,27 @@ def extra_functionality(n, snapshots):
             add_EQ_constraints(n, o)
     add_land_use_constraints(n)
 
-    ref_year = config["scenario"]["ref_year"]
-    if (
-        "CC" in opts and n.generators.p_nom_extendable.any()
-    ):  # and snapshots.unique('period') != n.investment_periods[0]:
-        print("\nAPPLYING COST CONSTRAINT (CC option detected)")
-        print(f"Options string: {'-'.join(opts)}")
-        # add_cost_constraint_based_on_calculation(n, snapshots, config, ref_year)
-        add_constant_cost_constraints(n, snapshots, config, ref_year)
-
+    # Set CO2 objective second, ensuring it doesn't impact the objective in constant_cost
     if "co2obj" in opts:
         print("\nSETTING CO2 MINIMIZATION OBJECTIVE (co2obj option detected)")
         print("This will minimize CO2 emissions subject to cost constraint")
-        n.model.objective = define_objective_co2(n, snapshots)
+        objective = define_objective_co2(n, snapshots)
+        # breakpoint()
+        n.model.objective = objective
+        logger.info("DEBUGGING THE LINEAR EXP")
+        logger.info(n.model.objective)
+
+    n = prepare_network(n, solve_opts)
+    print("-- After extra functionality --")
+    for name in ["generators", "storage_units", "links"]:
+        df = getattr(n, name)
+        print(f"{name} NaNs:\n", df.isna().sum())
 
 
 def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
     """Initiate the correct type of pypsa.optimize function."""
     # Add debugging before optimization
-    logger.info("🚀 STARTING OPTIMIZATION")
+    logger.info("STARTING OPTIMIZATION")
     logger.info("Model statistics:")
     if hasattr(n, "model") and n.model is not None:
         logger.info(f"  Variables: {len(n.model.variables)}")
@@ -2613,7 +2032,10 @@ def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
         status, condition = "", ""
 
     elif skip_iterations:
+        logger.warning(f"CALLING solve_model on network id={id(n)}, n.model id={id(getattr(n, 'model', None))}")
         status, condition = n.optimize(**kwargs)
+        logger.warning(f"RETURN from solve_model: n.model id is now {id(n.model)}")
+
     else:
         kwargs["track_iterations"] = (cf_solving.get("track_iterations", False),)
         kwargs["min_iterations"] = (cf_solving.get("min_iterations", 4),)
@@ -2626,35 +2048,25 @@ def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
         logger.warning(
             f"Solving status '{status}' with termination condition '{condition}'",
         )
-    if "infeasible" in condition:
+    if "infeasible" in condition or status != "ok":
+        print("Model is infeasible, checking infeasibilities...")
+        # infeas = n.model.compute_infeasibilities()
+        # print(infeas)
+        vars_df = n.model.variables.data  # This is a DataFrame
+        for varname, vardata in vars_df.items():
+            try:
+                # vardata is a linopy.variables.Variable (xarray.DataArray)
+                lower = vardata.lower
+                upper = vardata.upper
+                # Find entries where both lower == -inf and upper == inf
+                mask = (lower == -np.inf) & (upper == np.inf)
+                if mask.any():
+                    print(f"\nFree variables in {varname}:")
+                    print(vardata.where(mask, drop=True))
+            except Exception as e:
+                print(f"Error for variable {varname}: {e}")
+        n.model.print_infeasibilities()
         # Add debugging for infeasibility
-        logger.error("🚨 MODEL IS INFEASIBLE - ANALYZING CAUSES:")
-
-        # Check if we can relax the cost constraint to see if that's the issue
-        try:
-            constraint_names = list(n.model.constraints)
-            cost_constraints = [name for name in constraint_names if "cost" in name.lower()]
-        except Exception as e:
-            cost_constraints = []
-            logger.error(f"  Could not access constraint names: {e}")
-
-        if cost_constraints:
-            logger.error(f"  Cost constraints present: {cost_constraints}")
-            logger.error("  💡 SUGGESTION: Try relaxing cost constraint by 10-20% to test feasibility")
-            logger.error("     Or run without cost constraint (remove 'CC' from opts) to get baseline costs")
-
-        # Check objective vs constraints
-        logger.error("  Objective: CO2 minimization (very small penalty factor)")
-        logger.error("  Main constraint: Cost <= $17.56B")
-        logger.error("  💡 DIAGNOSIS: Likely cannot minimize CO2 within cost budget")
-        logger.error("     - CO2 minimization wants renewable/low-carbon tech")
-        logger.error("     - But renewables + storage might exceed cost limit")
-        logger.error("     - Reference network might be at cost-optimal (not CO2-optimal) point")
-
-        # Add breakpoint for interactive debugging
-        logger.error("  🔍 Uncomment breakpoint() in code to debug interactively")
-        # breakpoint()  # Uncomment this to debug
-
         # n.model.print_infeasibilities()
         raise RuntimeError("Solving status 'infeasible'")
 
@@ -2722,54 +2134,10 @@ def solve_network(n, config, solving, opts="", intermed_networks_dir=None, **kwa
                 # planning_horizons = snakemake.params.planning_horizons
                 sns_horizon = n.snapshots[n.snapshots.get_level_values(0) == planning_horizon]
 
-                if config["scenario"]["constant_cost_setup"]:
-                    # Save the unsolved network before optimization
-                    os.makedirs(intermed_networks_dir, exist_ok=True)
-                    unsolved_file = save_unsolved_network(n, planning_horizon, intermed_networks_dir, **kwargs)
-                    logger.info(f"Saved unsolved network to {unsolved_file}")
-
-                    # Save the objective expression
-                    obj_expr_dir = os.path.join(os.path.dirname(intermed_networks_dir), "objective_expressions")
-                    obj_expr_file = save_objective_expression(n, planning_horizon, obj_expr_dir, **kwargs)
-                    logger.info(f"Saved objective expression to {obj_expr_file}")
-
-                # add sns_horizon to kwarg
-                # kwargs["snapshots"] = sns_horizon
-
-                # run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs)
-                # period_cost = calculate_total_cost(n, sns_horizon)
-                # logger.info(f"System cost for planning horizon {planning_horizon}: ${period_cost:,.2f}")
-
-                #################### LOGGING FOR DEBUGGING ######################
-                # Calculate and log the system cost for this planning horizon
-
-                # Calculate estimated cost for components before optimization
-                if hasattr(n, "df"):
-                    capex_est = sum(
-                        (n.df(c)["capital_cost"] * n.df(c)["p_nom"]).sum()
-                        for c in ["Generator", "Link", "StorageUnit"]
-                        if hasattr(n, c)
-                    )
-                    logger.info(f"Estimated capital cost before optimization for {planning_horizon}: ${capex_est:,.2f}")
-
                 # Add sns_horizon to kwarg
                 kwargs["snapshots"] = sns_horizon
 
                 run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs)
-                # Calculate and log the system cost for this planning horizon
-                # period_cost = calculate_total_cost(n, ref_year)
-                # logger.info(f"System cost for planning horizon {planning_horizon}: ${period_cost:,.2f}")
-                # Save the solved network after optimization (especially important for the first period)
-                if config["scenario"]["constant_cost_setup"] and i == 0:
-                    os.makedirs(intermed_networks_dir, exist_ok=True)
-                    solved_file = save_solved_network(n, planning_horizon, intermed_networks_dir)
-                    logger.info(f"Saved solved network for planning horizon {planning_horizon} to {solved_file}")
-
-                # Update cumulative cost
-                # total_cumulative_cost += period_cost
-                # logger.info(f"Cumulative system cost up to {planning_horizon}: ${total_cumulative_cost:,.2f}")
-
-                #################### LOGGING FOR DEBUGGING ######################
 
                 # Brownfield preparation
                 if i == len(n.investment_periods) - 1:
@@ -2831,7 +2199,7 @@ def solve_network(n, config, solving, opts="", intermed_networks_dir=None, **kwa
                                 df_attrs["p_nom_extendable"] = True  # Ensure Links remain extendable
                                 n.add(nm, df_idx, **df_attrs)
                             else:
-                                # For StorageUnits, make them non-extendable in brownfield
+                                # For StorageUnits and Generators, make them non-extendable in brownfield
                                 df_attrs = df.loc[df_idx].copy()
                                 df_attrs["p_nom_extendable"] = False  # Brownfield assets are not extendable
                                 n.add(nm, df_idx, **df_attrs)
@@ -2844,6 +2212,16 @@ def solve_network(n, config, solving, opts="", intermed_networks_dir=None, **kwa
 
                     for tattr in n.component_attrs[nm].index[selection]:
                         n.import_series_from_dataframe(time_df[tattr], nm, tattr)
+
+                ##### DEBUGGING #####
+                for name in ["generators", "storage_units", "links"]:
+                    df = getattr(n, name)
+                    print(f"{name} after brownfield NaNs:\n", df.isna().sum())
+                    # Optionally print p_nom_min/max stats
+                    if "p_nom_min" in df.columns:
+                        print(f"{name} p_nom_min: min={df['p_nom_min'].min()}, max={df['p_nom_min'].max()}")
+                    if "p_nom_max" in df.columns:
+                        print(f"{name} p_nom_max: min={df['p_nom_max'].min()}, max={df['p_nom_max'].max()}")
 
                 # roll over the last snapshot of time varying storage state of charge to be the state_of_charge_initial for the next time period
                 n.storage_units.loc[:, "state_of_charge_initial"] = n.storage_units_t.state_of_charge.loc[
@@ -2894,12 +2272,36 @@ if __name__ == "__main__":
 
     n = pypsa.Network(snakemake.input.network)
 
+    print("-- After load --")
+    for name in ["generators", "storage_units", "links"]:
+        df = getattr(n, name)
+        print(f"{name} NaNs:\n", df.isna().sum())
+
+    # ## debugging the infeasibility:
+    # for df_name in ['generators', 'storage_units', 'links']:
+    #     df = getattr(n, df_name)
+    #     # Set minimum capacity to 0 if missing
+    #     if 'p_nom_min' in df.columns:
+    #         df['p_nom_min'] = df['p_nom_min'].fillna(0)
+    #     # Set maximum capacity to a sensible value if missing (adjust as needed)
+    #     if 'p_nom_max' in df.columns:
+    #         df['p_nom_max'] = df['p_nom_max'].fillna(1e18)
+    #     # Make sure extendable is boolean and has no NaN
+    #     if 'p_nom_extendable' in df.columns:
+    #         df['p_nom_extendable'] = df['p_nom_extendable'].fillna(False)
+
     intermed_networks_dir = os.path.join(os.path.dirname(snakemake.output[0]), "unsolved_networks")
 
     n = prepare_network(
         n,
         solve_opts,
     )
+
+    n = prepare_network(n, solve_opts)
+    print("-- After prepare_network --")
+    for name in ["generators", "storage_units", "links"]:
+        df = getattr(n, name)
+        print(f"{name} NaNs:\n", df.isna().sum())
 
     n = solve_network(
         n,
@@ -2909,6 +2311,13 @@ if __name__ == "__main__":
         log_fn=snakemake.log.solver,
         intermed_networks_dir=intermed_networks_dir,
     )
+
+    n = prepare_network(n, solve_opts)
+
+    print("-- After prepare_network --")
+    for name in ["generators", "storage_units", "links"]:
+        df = getattr(n, name)
+        print(f"{name} NaNs:\n", df.isna().sum())
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
     n.export_to_netcdf(snakemake.output[0])
     with open(snakemake.output.config, "w") as file:
