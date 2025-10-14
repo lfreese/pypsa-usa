@@ -250,12 +250,12 @@ def prep_brownfield(n, planning_horizon):
                     p_min_pu=df.loc[df_idx].p_min_pu,
                     p_max_pu=df.loc[df_idx].p_max_pu,
                     land_region=df.loc[df_idx].land_region,
-                )
+                )  ##TODO: fix and see how dispatch variables
             else:
                 # For Links, ensure proper brownfield setup
                 if nm == "Link":
                     df_attrs = df.loc[df_idx].copy()
-                    df_attrs["p_nom_extendable"] = False  # Ensure Links remain extendable
+                    # df_attrs["p_nom_extendable"] = False ## RETAIN SAME EXTENDABILITY AS BEFORE
                     n.add(nm, df_idx, **df_attrs)
                 else:
                     # For StorageUnits and Generators, make them non-extendable in brownfield
@@ -313,22 +313,10 @@ def constant_cost(n, config, ref_year, model_kwargs):  # , **kwargs):
         ref_year
     ]  ##TODO: fix this to be fixed cost of our current system
     current_yr = model_kwargs.get("snapshots").get_level_values("period").unique()
-    # if current_yr != ref_year:
-    #     yrs = n.snapshots.get_level_values("period").unique()
-
-    #     # If current_yr is an array with one value, get the scalar
-
-    #     if len(current_yr) == 1:
-    #         current_yr = current_yr[0]
-    #     # Now filter yrs for years less than current_yr
-    #     prior_years = [yr for yr in yrs if yr < current_yr]
-
-    #     capex_prior_times = n.statistics.capex().sum()[prior_years]
-    #     optimal_cost += capex_prior_times.values[0]
     # breakpoint()
     logger.info(f"Snapshots for our objective in constant cost {current_yr}")
     # get the objective from our model
-    m = n.optimize.create_model(**model_kwargs)
+    m = n.optimize.create_model(**model_kwargs)  ## TODO: fix the snapshots issue
     original_objective = m.objective
     logger.info(f"{original_objective}")
     # breakpoint()
@@ -351,7 +339,7 @@ def constant_cost(n, config, ref_year, model_kwargs):  # , **kwargs):
         constant=optimal_cost * scale_factor,
     )
 
-    buffer = 1
+    buffer = 1.02  # needs 2% buffer for feasibility in just one 2030 time period
     n.model.add_constraints(
         (original_objective + fixed_cost) * scale_factor <= optimal_cost * scale_factor * buffer,
         name=f"GlobalConstraint-{name}",
@@ -397,7 +385,9 @@ def define_objective_co2(n, sns):
     period_emissions = p_em * em_pu_xr * period_weighting_xr
     total_emissions += period_emissions.sum()
     objective = total_emissions  # * penalty_factor
-    logger.info(f"Total emissions expression: {total_emissions}")
+    logger.info(
+        f"Total emissions expression: {total_emissions}",
+    )  ## TODO: ensure this is for the right time period when multiple horizons
     return objective
 
 
@@ -490,6 +480,7 @@ def solve_network(n, config, solving, opts="", **kwargs):
 
                 # Add sns_horizon to kwarg
                 model_kwargs["snapshots"] = sns_horizon
+                model_kwargs["multi_investment_periods"] = True
                 if len(sns_horizon) == 0:
                     raise ValueError(f"Snapshots for planning horizon {planning_horizon} are empty!")
 

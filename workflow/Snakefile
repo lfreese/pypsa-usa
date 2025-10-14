@@ -13,12 +13,12 @@ from pathlib import Path
 import pandas as pd
 
 FIGURES_MAPS = [
-    "capacity_map_base.pdf",
-    "capacity_map_optimized.pdf",
-    "capacity_map_new.pdf",
-    "emissions_map.pdf",
-    "renewable_potential_map.pdf",
-    "demand_map.pdf",
+    # "capacity_map_base.pdf",
+    # "capacity_map_optimized.pdf",
+    # "capacity_map_new.pdf",
+    # "emissions_map.pdf",
+    # "renewable_potential_map.pdf",
+    # "demand_map.pdf",
     # "lmp_map.pdf",
 ]
 

@@ -26,7 +26,7 @@ pypsa_usa_datafiles = [
 
 def define_zenodo_databundles():
     return {
-        "USATestSystem": "https://zenodo.org/record/4538590/files/USATestSystem.zip",
+        "USATestSystem": "https://zenodo.org/records/4538590/files/USATestSystem.zip",
         "pypsa_usa_data": "https://zenodo.org/records/14219029/files/pypsa_usa_data.zip",
     }
 
