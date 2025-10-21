@@ -1483,13 +1483,81 @@ def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
         raise RuntimeError("Solving status 'infeasible'")
 
 
+def freeze_period(n: pypsa.Network, planning_horizon: int):
+    """
+    Freeze optimized capacities from a planning horizon as non-extendable for next period.
+
+    Sets all assets built in this planning_horizon to their optimized capacity
+    and makes them non-extendable for future periods.
+    """
+    logger.info(f"Freezing optimized capacities from {planning_horizon}")
+
+    # Freeze transmission (lines don't have build_year, so freeze all) ##TODO: what should we do with lines??
+    n.lines.s_nom = n.lines.s_nom_opt
+    n.lines.s_nom_min = n.lines.s_nom_opt
+
+    # Freeze DC links (may not have build_year, so freeze all DC links) ##TODO: what should we do with DC links??
+    dc_i = n.links[n.links.carrier == "DC"].index
+    if not dc_i.empty:
+        n.links.loc[dc_i, "p_nom"] = n.links.loc[dc_i, "p_nom_opt"]
+        n.links.loc[dc_i, "p_nom_min"] = n.links.loc[dc_i, "p_nom_opt"]
+
+    frozen_summary = {}
+
+    # Freeze generators, links, storage units, and stores based on build_year
+    for c in n.iterate_components(["Generator", "Link", "StorageUnit", "Store"]):
+        nm = c.name
+
+        # Filter by build_year matching this planning horizon
+        if "build_year" not in c.df.columns:
+            continue
+
+        assets_this_period = c.df[c.df.build_year == planning_horizon].index
+
+        if assets_this_period.empty:
+            continue
+
+        # Determine attribute name (e_nom for Store, p_nom for others)
+        attr = "e_nom" if nm == "Store" else "p_nom"
+
+        # Freeze ALL assets from this build year
+        c.df.loc[assets_this_period, attr] = c.df.loc[assets_this_period, f"{attr}_opt"]
+        c.df.loc[assets_this_period, f"{attr}_min"] = c.df.loc[assets_this_period, f"{attr}_opt"]
+        c.df.loc[assets_this_period, f"{attr}_extendable"] = False
+
+        # Log details about frozen assets
+        total_capacity = c.df.loc[assets_this_period, f"{attr}_opt"].sum()
+        frozen_summary[nm] = {
+            "count": len(assets_this_period),
+            "total_capacity_MW": total_capacity,
+        }
+
+        logger.info(f"Froze {len(assets_this_period)} {nm} components from build year {planning_horizon}")
+
+    # Log frozen summary
+    logger.info(f"Frozen capacity summary for {planning_horizon}:")
+    for component, stats in frozen_summary.items():
+        logger.info(f"  {component}: {stats['count']} assets, {stats['total_capacity_MW']:.2f} MW")
+
+    # Roll over storage state of charge
+    if not n.storage_units.empty:
+        n.storage_units.loc[:, "state_of_charge_initial"] = n.storage_units_t.state_of_charge.loc[
+            planning_horizon
+        ].iloc[-1]
+
+    if not n.stores.empty and "e" in n.stores_t:
+        store_with_soc = n.stores[n.stores.index.isin(n.stores_t.e.columns)]
+        if not store_with_soc.empty:
+            n.stores.loc[store_with_soc.index, "e_initial"] = n.stores_t.e.loc[planning_horizon].iloc[-1]
+
+
 def solve_network(n, config, solving, opts="", **kwargs):
     set_of_options = solving["solver"]["options"]
     cf_solving = solving["options"]
 
     foresight = snakemake.params.foresight
-    # if len(n.investment_periods) > 1:
-    kwargs["multi_investment_periods"] = config["foresight"] == foresight
+
+    # kwargs["multi_investment_periods"] = config["foresight"] == foresight
     logger.info(f"Using {foresight} foresight")
 
     kwargs["solver_options"] = solving["solver_options"][set_of_options] if set_of_options else {}
@@ -1514,90 +1582,33 @@ def solve_network(n, config, solving, opts="", **kwargs):
 
     match foresight:
         case "perfect":
+            kwargs["multi_investment_periods"] = True
             run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs)
         case "myopic":
+            kwargs["multi_investment_periods"] = False
             for i, planning_horizon in enumerate(n.investment_periods):
-                # planning_horizons = snakemake.params.planning_horizons
                 sns_horizon = n.snapshots[n.snapshots.get_level_values(0) == planning_horizon]
 
-                # add sns_horizon to kwarg
+                # Set snapshots for this period
                 kwargs["snapshots"] = sns_horizon
 
+                # Optimize this period
                 run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs)
 
                 if i == len(n.investment_periods) - 1:
                     logger.info(f"Final time horizon {planning_horizon}")
                     continue
+
                 logger.info(f"Preparing brownfield from {planning_horizon}")
 
-                # electric transmission grid set optimised capacities of previous as minimum
-                n.lines.s_nom_min = n.lines.s_nom_opt  # for lines
-                dc_i = n.links[n.links.carrier == "DC"].index
-                n.links.loc[dc_i, "p_nom_min"] = n.links.loc[dc_i, "p_nom_opt"]  # for links
+                # Freeze this period's results before moving to next period
+                freeze_period(n, planning_horizon)
 
-                for c in n.iterate_components(["Generator", "Link", "StorageUnit"]):
-                    nm = c.name
-                    # limit our components that we remove/modify to those prior to this time horizon
-                    c_lim = c.df.loc[n.get_active_assets(nm, planning_horizon)]
-
-                    logger.info(f"Preparing brownfield for the component {nm}")
-                    # attribute selection for naming convention
-                    attr = "p"
-                    # copy over asset sizing from previous period
-                    c_lim[f"{attr}_nom"] = c_lim[f"{attr}_nom_opt"]
-                    c_lim[f"{attr}_nom_extendable"] = False
-                    df = copy.deepcopy(c_lim)
-                    time_df = copy.deepcopy(c.pnl)
-
-                    for c_idx in c_lim.index:
-                        n.remove(nm, c_idx)
-
-                    for df_idx in df.index:
-                        if nm == "Generator":
-                            n.madd(
-                                nm,
-                                [df_idx],
-                                carrier=df.loc[df_idx].carrier,
-                                bus=df.loc[df_idx].bus,
-                                p_nom_min=df.loc[df_idx].p_nom_min,
-                                p_nom=df.loc[df_idx].p_nom,
-                                p_nom_max=df.loc[df_idx].p_nom_max,
-                                p_nom_extendable=df.loc[df_idx].p_nom_extendable,
-                                ramp_limit_up=df.loc[df_idx].ramp_limit_up,
-                                ramp_limit_down=df.loc[df_idx].ramp_limit_down,
-                                efficiency=df.loc[df_idx].efficiency,
-                                marginal_cost=df.loc[df_idx].marginal_cost,
-                                capital_cost=df.loc[df_idx].capital_cost,
-                                build_year=df.loc[df_idx].build_year,
-                                lifetime=df.loc[df_idx].lifetime,
-                                heat_rate=df.loc[df_idx].heat_rate,
-                                fuel_cost=df.loc[df_idx].fuel_cost,
-                                vom_cost=df.loc[df_idx].vom_cost,
-                                carrier_base=df.loc[df_idx].carrier_base,
-                                p_min_pu=df.loc[df_idx].p_min_pu,
-                                p_max_pu=df.loc[df_idx].p_max_pu,
-                                land_region=df.loc[df_idx].land_region,
-                            )
-                        else:
-                            n.add(nm, df_idx, **df.loc[df_idx])
-                    logger.info(n.consistency_check())
-
-                    # copy time-dependent
-                    selection = n.component_attrs[nm].type.str.contains(
-                        "series",
-                    )
-
-                    for tattr in n.component_attrs[nm].index[selection]:
-                        n.import_series_from_dataframe(time_df[tattr], nm, tattr)
-
-                # roll over the last snapshot of time varying storage state of charge to be the state_of_charge_initial for the next time period
-                n.storage_units.loc[:, "state_of_charge_initial"] = n.storage_units_t.state_of_charge.loc[
-                    planning_horizon
-                ].iloc[-1]
+                # Verify network consistency
+                logger.info(n.consistency_check())
 
         case _:
             raise ValueError(f"Invalid foresight option: '{foresight}'. Must be 'perfect' or 'myopic'.")
-
     return n
 
 
